@@ -1,6 +1,6 @@
 from maze_utils import Maze
-from in_maze_model import InMazeModelNN
-from data_generation import generate_trajectory_history
+from in_maze_model import InMazeModelNN, GridClassifier
+from data_generation import generate_trajectory_history, data_to_index, index_to_data
 from state_process_models import *
 import matplotlib.pyplot as plt
 import torch
@@ -11,8 +11,9 @@ import numpy as np
 
 # method for simulating trajectory using generative trajectory model
 def trajectory_simulator(
-        model, inside_maze_model, transform, init_sample, n_points, 
-        Wmaze, threshold = 0.9, plot_trajectory = False, random_walk = False):
+        model, inside_maze_model, transform, init_sample, history_length, n_points, Wmaze, 
+        threshold = 0.9, threshold_decay = False, decay = 0.005, min_threshold = 0.6, 
+        plot_trajectory = False, plot_rejection = False, random_walk = False):
     # model: generative trajectory model
     # inside_maze_model: classifier model producing probability of trajectory being inside maze
     # transform: fitted transform object used to transform raw data
@@ -20,6 +21,8 @@ def trajectory_simulator(
     # n_points: number of points to attempt simulating
     # Wmaze: untransformed Wmaze data; used for plotting
     # threshold: probability threshold required to continue simulating trajectory
+    # threshold_decay: boolean indicating whether to implement threshold decay
+    # decay: increment of threshold decay
     # plot_trajectory: boolean indicating whether to plot simulated trajectory
     # random_walk: boolean indicating whether a random walk model is used to simulate trajectory
     
@@ -28,6 +31,9 @@ def trajectory_simulator(
     
     # initialize history of probabilities
     prob_hist = torch.ones((1,init_sample.size(1),1))
+    
+    # initialize list to hold rejection counts
+    count_list = []
     
     # initialize list to hold simulated data points
     pos = []
@@ -38,7 +44,7 @@ def trajectory_simulator(
         input_ = torch.cat([x_prev, prob_hist], dim = -1).flatten(1,-1)
         
         if random_walk:
-            var = torch.var(x_prev, dim = 1).squeeze()
+            var = torch.tensor([.000005, .00002])
         
         # initialize sample rejection counter
         count = 0
@@ -54,7 +60,7 @@ def trajectory_simulator(
             
             # determine probability of new trajectory being inside maze
             inquiry = torch.cat([x_prev[:,1:,:], xi], dim = 1)
-            prob = inside_maze_model(inquiry)
+            prob = inside_maze_model(xi.squeeze(1)).squeeze()
             
             # update counter
             count += 1
@@ -68,14 +74,32 @@ def trajectory_simulator(
                 # end while loop
                 done = True
             
-            # break from infinite loop
+            # if using threshold decay
+            if threshold_decay:
+                # criteria to decrease threshold
+                if count % 100 == 0:
+                    threshold -= decay
+                    # simulation stopping criteria
+                    if threshold <= min_threshold:
+                        break
+            # if not using threshold decay
+            else:
+                # break from infinite loop
+                if count >= 100:
+                    break
+        
+        # if using threshold decay
+        if threshold_decay:
+            # criteria for stopping simulation
+            if threshold <= min_threshold:
+                break
+        else:
+            # break from for loop if infinite while loop is encountered
             if count >= 100:
                 break
         
-        # break from for loop if infinite loop is encountered
-        if count >= 100:
-            break
-        
+        # save rejection counts
+        count_list.append(count - 1)
         # save new data point to list
         pos.append(xi)
         # update x_prev
@@ -86,62 +110,29 @@ def trajectory_simulator(
     pos = transform.untransform(pos).squeeze(1).detach().numpy()
     
     # plotting
-    if plot_trajectory:
-        dt = 0.033
-        time = np.arange(pos.shape[0]) * dt    
-        
-        fig, ax = plt.subplots(2,1, sharex = True)
-        
-        plt.xlabel('Time [s]')
-        
-        ax[0].plot(time, pos[:,0], 'k')
-        ax[0].set_ylabel('X position')
-        
-        ax[1].plot(time, pos[:,1], 'k')
-        ax[1].set_ylabel('Y position')
-        
-        fig.suptitle('Trajectory Simulated by Model')
-        plt.show()
-        
+    if plot_rejection:
         
         plt.figure()
-        plt.plot(Wmaze[:,0], Wmaze[:,1], '0.4')
+        plt.plot(np.arange(1, len(count_list)+1), count_list, 'k')
+        plt.xlabel('Simulated Point')
+        plt.ylabel('Rejection Count')
+        plt.title(f'Rejection Count For Each Simulated Point | HL = {history_length}')
+        
+    if plot_trajectory:
+        plt.figure()
+        plt.plot(Wmaze[:,0], Wmaze[:,1], 'o', color = '0.6', markersize = 0.5)
         plt.plot(pos[:,0], pos[:,1], 'red')
+        plt.plot(pos[0,0], pos[0,1], 'o', color = 'k', markersize = 5, label = 'start')
+        plt.plot(pos[-1,0], pos[-1,1], 'o', color = 'yellow', markersize = 5, label = 'end')
+        plt.legend(loc = 'upper right', fontsize = 8)
         
         plt.xlabel('X axis')
         plt.ylabel('Y axis')
-        plt.title('Maze Shape (X-Y) view')
+        plt.title(f'Maze Shape (X-Y) View | HL = {history_length} | n_points = {i}')
         plt.show()
         
     return pos
-
-
-# random walk model
-class RandomWalk(nn.Module):
-    
-    def __init__(self, xvar = 0.2857/200, yvar = 0.6330/200):
-        super(RandomWalk, self).__init__()
-        
-        covar = torch.zeros((2,2))
-        covar[0,0] = xvar
-        covar[1,1] = yvar
-        self.covar = covar
-
-    def forward(self, x, var = None):
-        x = x[:,-3:-1]
-        
-        if var is None:
-            return MultivariateNormal(x, self.covar).sample()
-        else:
-            covar = torch.zeros((2,2))
-            covar[0,0] = var[0]
-            covar[1,1] = var[1]
-            return MultivariateNormal(x, covar).sample()
-            
-    
-    def predict(self, x, var = None):
-        return self.forward(x, var)
-
+                
 
 
 if __name__ == '__main__':
@@ -193,11 +184,20 @@ if __name__ == '__main__':
         # initialize random walk
         # this implementation still needs work
         model = RandomWalk()
-
-    # initialize and load in-maze classifier
-    insideMaze = InMazeModelNN(hidden_layer_sizes = [24,24], feature_dim = 2, history_length = hl)
-    insideMaze.load_state_dict(
-        torch.load(f'InMaze/insideMaze_AUC_2LayerMLP_state_dict_HL{hl}.pt'))
+    
+    
+    use_grid_classifier = True
+    
+    if use_grid_classifier:
+        insideMaze = GridClassifier(
+            grid = torch.load('InMaze/maze_grid_classifier_[-50,150]_res2.pt'), 
+            xmin = -50, ymin = -50, resolution = 2, transform = tf)
+    
+    else:
+        # initialize and load in-maze classifier
+        insideMaze = InMazeModelNN(hidden_layer_sizes = [32,32], feature_dim = 2, history_length = hl)
+        insideMaze.load_state_dict(
+            torch.load(f'InMaze/insideMaze_AUC_2LayerMLP_state_dict_HL{hl}.pt'))
     
     
     # get untransformed maze data for plotting purposes
@@ -210,7 +210,7 @@ if __name__ == '__main__':
     
     if plot_possible_inits:
         # generate in-maze classifier probabilities        
-        probs = insideMaze(dat)
+        probs = insideMaze(dat[:,-1,:])
         # get indexes of trajectories with in-maze classifier probability 
         #   greater than init_threshold
         idxs = torch.nonzero(torch.where(probs > init_threshold, 1, 0))
@@ -234,12 +234,34 @@ if __name__ == '__main__':
         # randomly sample data point from maze
         init_sample = dat[torch.randint(dat.size(0), (1,)),:,:]
         # generate in-maze classifier probability of initial sample being inside maze
-        prob = insideMaze(init_sample)
+        prob = insideMaze(init_sample[:,-1,:])
         # threshold condition
         if prob > init_threshold:
             # break from while loop
             done = True
     print('  sample found.....\n')
+    
+    
+# =============================================================================
+#     probs = insideMaze(dat[:,-1,:])
+#     print(dat.size(), probs.sum())    
+#     
+#     grid = insideMaze.grid
+#     
+#     in_maze = []
+#     for i in range(grid.size(0)):
+#         for j in range(grid.size(1)):
+#             if grid[i,j] == 1:
+#                 in_maze.append(torch.tensor([i,j]).unsqueeze(0))
+#     in_maze = torch.cat(in_maze, dim = 0)
+#     in_maze = index_to_data(in_maze, -50, -50, 2)
+#     
+#     plt.figure()
+#     plt.plot(in_maze[:,0], in_maze[:,1], 'o', color = 'k', markersize = 5)
+#     plt.plot(Wmaze[:,0], Wmaze[:,1], 'o', color = '0.4', markersize = 0.5)
+# =============================================================================
+    
+    
     
     
     # run trajectory simulation
@@ -248,9 +270,13 @@ if __name__ == '__main__':
         inside_maze_model = insideMaze, 
         transform = tf, 
         init_sample = init_sample, 
-        n_points = 1000, 
+        history_length = hl,
+        n_points = 5000, 
         Wmaze = Wmaze, 
-        threshold = 0.8, 
+        threshold = init_threshold, 
+        threshold_decay = False,
+        min_threshold = init_threshold-0.05,
+        plot_rejection = False,
         plot_trajectory = True, 
         random_walk = not use_trajectory_model,
         )    

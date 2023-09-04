@@ -1,10 +1,10 @@
 from copy import deepcopy
 import scipy.io as sio
-from utils import *
 import matplotlib.pyplot as plt
 import torch
+from torch.utils.data import Dataset
 import numpy as np
-
+import mat73
 
 # plot maze data for a given rat and session
 def plot_maze(name, session, Fs, n_points):
@@ -31,8 +31,12 @@ def plot_maze(name, session, Fs, n_points):
             posRaw = np.delete(posRaw, np.where(np.isnan(posRaw)), axis = 0)
         
     elif name == 'Bon':
-        with h5py.File(f'Datasets/SunMaze/Bon/bonpos0{session[0]}.mat', 'r') as f:
-            posRaw = open(f['pos'])
+        spikesFile = mat73.loadmat(f'Datasets/SunMaze/Bon/Bonspikes0{session[0]}.mat')
+        print(spikesFile)
+# =============================================================================
+#         with h5py.File(f'Datasets/SunMaze/Bon/bonpos0{session[0]}.mat', 'r') as f:
+#             posRaw = open(f['pos'])
+# =============================================================================
     
     
     posRaw -= posRaw.min(axis = 0)
@@ -141,7 +145,10 @@ def plot_model_predictions(pred_mean, pred_vars, label_data, title, plot_arm_pro
 # class used to loading and holding maze data (spike data and position data)
 class Maze(object):
     
-    def __init__(self, name, session, n_points, Fs, rem_insig_chans = False, threshold = None):
+    def __init__(self, 
+                 name, session, n_points, include_velocity = False, dirvel = True,
+                 rem_insig_chans = False, threshold = None,
+                 ):
         # name: name of rat
         # session: session to be plotted
         # Fs: sampling frequency
@@ -152,7 +159,6 @@ class Maze(object):
             'name' : name,
             'session' : session,
             'n_points' : n_points,
-            'Fs' : Fs,
             }
         
         # load spike and position data for given rat name and session
@@ -162,107 +168,156 @@ class Maze(object):
             
             posRaw = sio.loadmat(f'Datasets/SunMaze/Remy/remypos{session[0]}.mat')['pos'][0][-1][0][session[1]][0][0][3][:,:5]
             
+            ntrodes = [i for i in range(30) if i not in rem]
+            dat = []
+            for n in ntrodes:
+                dat.append(spikesFile[n][0][0][-2].reshape(-1))
         
         elif name == 'Jaq':
             spikesFile = sio.loadmat(f'Datasets/SunMaze/Jaq/Jaqspikes0{session[0]}.mat')['spikes'][0][-1][0][session[1]][0]
             rem = [12,18]
+# =============================================================================
+#             for i in spikesFile:
+#                 print(i[0][0][0], i.shape)
+# =============================================================================
+# =============================================================================
+#             inq = spikesFile[1]
+#             print(inq, inq.shape)
+# =============================================================================
+            idx = 0            
+            inq = []
+            for s in spikesFile:
+                s = s.reshape(-1)
+                #print(s.shape)
+                for i in s:
+                    if i.shape == (1,1):
+                        print(idx, len(i[0][0]), i[0][0])
+                        #inq.append(i[0][0][0])
+                        #print('    ', i[0][0][0].shape)
+                        idx += 1
+            
+            for i in inq:
+                print('%.2f, %.2f,' % (i.min(), i.max()), i[0].shape)
+                #print(i)
+            print(len(inq))
+# =============================================================================
+#             for i in inq:
+#                 print(i[1])
+# =============================================================================
+            
+
+# =============================================================================
+#             inq = spikesFile[24][0]#[4][0][0][4]#[4]#[0][0][0][0]
+#             print(inq, inq.shape)
+#             
+#             for i in inq:
+#                 print(i.shape)
+#                 if i.shape == (1,1):
+#                     print(i[0][0][4][0][0])
+# =============================================================================
+            
             
             if session[0] <= 2:
-                posRaw = sio.loadmat(f'Datasets/SunMaze/Jaq/Jaqpos0{session[0]}.mat')['pos'][0][-1][0][session[1]][0][0][0][:,1:5]
+                posRaw = sio.loadmat(f'Datasets/SunMaze/Jaq/Jaqpos0{session[0]}.mat')['pos'][0][-1][0][session[1]][0][0][0][:,:5]
             else:
-                posRaw = sio.loadmat(f'Datasets/SunMaze/Jaq/Jaqposdlc0{session[0]}.mat')['posdlc'][0][-1][0][session[1]][0][0][0]
+                posRaw = sio.loadmat(f'Datasets/SunMaze/Jaq/Jaqposdlc0{session[0]}.mat')['posdlc'][0][-1][0][session[1]][0][0][0][0,:]
+                print(posRaw, posRaw.shape)
         
+        elif name == 'Bon':
+            spikesFile = sio.loadmat(f'Datasets/SunMaze/Bon/Bonspikes0{session[0]}.mat')['spikes'][0][-1][0][session[1]][0]#[11]#[0][0]#[0][0][0][:,-1]
+            #print(spikesFile, spikesFile.shape)
             
-        # remove certain ntrodes due to nan values or missing data    
-        ntrodes = [i for i in range(30) if i not in rem]
+            rem = [10, 20, 26, 27, 31]
+            rem += list(range(38, 100))
+            #print(rem)
+            ix = 0
+            dat = []
+            for f in spikesFile:
+                f = f[0]
+                if f.shape[0] != 0:
+                    for c in f:
+                        if c.shape == (1,1):
+                            c = c[0][0]
+                            #print(ix, c[0].shape)
+                            if ix not in rem:
+                                dat.append(c[0][:,0])
+                            ix += 1
+                            
+            posRaw = mat73.loadmat(f'Datasets/SunMaze/Bon/Bonpos0{session[0]}.mat')['pos'][-1][session[1]]['data'][:,:5]
+        
+        
+        elif name == 'Emile':
+            spikesFile = mat73.loadmat(f'Datasets/SunMaze/Emile/emilespikes{session[0]}.mat')['spikes'][-1][session[1]]#[2][0]
+            
+            rem = [14, 25, 79, 91]
+            dat = []
+            for i in range(len(spikesFile)):
+                s = spikesFile[i]
+                if s != None:
+                    for j in range(len(s)):
+                        #print(i, j, type(s[j]), len(s[j]))
+                        #if type(s[j]['data']) != type(None):
+                        dat.append(s[j]['data'])
+            dat = [dat[i] for i in range(len(dat)) if i not in rem]
+            
+# =============================================================================
+#             for i in range(len(dat)):
+#                 print(i, type(dat[i]), dat[i].shape if type(dat[i]) == type(np.array(0)) else '')
+# =============================================================================
+                
+            posRaw = sio.loadmat(f'Datasets/SunMaze/Emile/emilepos{session[0]}.mat')['pos'][0][-1][0][session[1]][0][0][3][:,:3]
+            #print(posRaw, posRaw.shape)
+# =============================================================================
+#             for p in posRaw:
+#                 print(p, p.shape)
+# =============================================================================
+            
+        
+        if n_points != 'all':
+            posRaw = posRaw[:n_points,:]
+        
+        #posRaw[:,1:] -= posRaw[:,1:].min(axis = 0)
         
         # basic data cleaning to yield spike train data from spike times
-        dat = []
-        for n in ntrodes:
-            dat.append(spikesFile[n][0][0][-2])
-
-        min_ = 1e99999
-        max_ = -1e99999
-        for d in dat:
-            m = d.min(axis=0)[0]
-            if m < min_:
-                min_ = m
-            
-            m = d.max(axis=0)[0]
-            if m > max_:
-                max_ = m
+        spikes = torch.zeros((posRaw.shape[0],len(dat)))
         
-        if n_points == 'all':
-            t_end = 1e99
-        else:
-            t_end = n_points / Fs
-        
-        self.info['time_length_sec'] = t_end
-        
-        data = []
-        for d in dat:
-            d -= min_
-            
+        for j in range(len(dat)):
             idx = 0
-            while d[idx] < t_end:
-                idx += 1
-            
-            data.append(d[:idx])
-        
-        neurons = []
-        for d in data:
-            idxs = torch.from_numpy(d * Fs).round()     
+            for i in range(posRaw.shape[0]):
+                count = 0
+                done = False
+                while not done:
+                    #print(dat[j].shape)
+                    if idx >= dat[j].shape[0]:
+                        done = True
+                    elif dat[j][idx] < posRaw[i,0]:
+                        idx += 1
+                        count += 1
+                    else:
+                        done = True
+                spikes[i,j] = count
 
-            neuron = torch.zeros((1,n_points))
-            neuron[0,idxs.long()] = 1
-            
-            neurons.append(neuron)
-        
-        self.spikes = torch.cat(neurons, dim = 0)
 
         if rem_insig_chans:
             if threshold == None:
                 threshold = 100
             
-            self.spikes = torch.cat([
-                self.spikes[i,:].unsqueeze(0) for i in range(self.spikes.size(0))
-                if self.spikes[i,:].sum() >= threshold
-                ], dim = 0)                
+            spikes = torch.cat([
+                spikes[:,i].unsqueeze(1) for i in range(spikes.size(1))
+                if spikes[:,i].sum() >= threshold
+                ], dim = 1)
         
+        self.spike_times = dat
+        self.spike_counts = spikes
+        self.pos = torch.from_numpy(posRaw[:,1:])
         
-        # preprocessing to yield xvel and yvel from vel and dir
-        posRaw[:,:3] -= posRaw[:,:3].min(axis = 0)
-        
-        xvel = posRaw[:,4] * np.cos(posRaw[:,3])
-        yvel = posRaw[:,4] * np.sin(posRaw[:,3])
-            
-        posRaw[:,3] = xvel
-        posRaw[:,4] = yvel
-        
-        # other position data preprocessing
-        if n_points == 'all':
-            posRaw = torch.from_numpy(posRaw)
+        if include_velocity:
+            if not dirvel:
+                xvel = torch.cos(self.pos[:,2]) * self.pos[:,3]
+                yvel = torch.sin(self.pos[:,2]) * self.pos[:,3]
+                self.pos[:,2], self.pos[:,3] = xvel, yvel
         else:
-            idx = 0
-            while posRaw[idx,0] < t_end:
-                idx += 1
-            posRaw = torch.from_numpy(posRaw[0:idx,:])
-        self.posRaw = posRaw[:,1:]
-        
-        idxs = torch.cat([
-            (posRaw[:,0] * Fs).floor(),
-            torch.tensor([n_points]),
-            ]).long()
-        
-        posx = []
-        posy = []
-        for i in range(posRaw.size(0)):
-            len_ = idxs[i+1] - idxs[i]
-            posx.append(posRaw[i,1].repeat(len_))
-            posy.append(posRaw[i,2].repeat(len_))
-        
-        self.x_pos = torch.cat(posx, dim = 0)
-        self.y_pos = torch.cat(posy, dim = 0)    
+            self.pos = self.pos[:,:2]
         
     
     # method for downsampling position data
@@ -310,6 +365,56 @@ class Maze(object):
         return torch.cat(history_data, dim = 0).float()
                 
     
+    def generate_observation_process_data(
+            self, spike_history_length = 0, spike_bin_size = 1, position_history_length = 0, shuffle = False,
+            ):
+        lower_index = max(
+            0 if spike_history_length == 0 else spike_history_length+1,
+            position_history_length,
+            )
+        
+        if spike_history_length == 0:
+            spike_data = self.spike_counts[lower_index:-1,:].unsqueeze(1)
+            
+        else:
+            spike_hist = torch.cat([
+                self.spike_counts[i-(spike_history_length+1):i,:].unsqueeze(0) 
+                for i in range(lower_index, self.spike_counts.size(0))
+                ], dim = 0)
+            
+            if spike_bin_size == 1:
+                spike_data = spike_hist
+            else:
+                num_bins = int(spike_history_length/spike_bin_size)
+                spike_data = []
+                for i in range(spike_hist.size(0)):
+                    dat = spike_hist[i,:,:]
+                    new = []
+                    lower = 0
+                    upper = spike_bin_size
+                    for j in range(num_bins):
+                        new.append(dat[lower:upper,:].sum(0).unsqueeze(0))
+                    new.append(dat[-1,:].unsqueeze(0))
+                    new = torch.cat(new, dim = 0).unsqueeze(0)
+                    spike_data.append(new)
+                spike_data = torch.cat(spike_data, dim = 0)
+                        
+        if position_history_length == 0:
+            pos = self.pos[lower_index:,:]
+        else:
+            pos = torch.cat([
+                self.pos[i-position_history_length:i+1,:].unsqueeze(0) 
+                for i in range(lower_index, self.pos.size(0))
+                ], dim = 0)
+        
+        if shuffle:
+            order = torch.randperm(spike_data.size(0))
+            spike_data = spike_data[order]
+            pos = pos[order]
+                
+        return spike_data, pos
+    
+    
     # method for plotting heat map of spike train data
     def plot_spikes_heat_map(self, directory = None):
         spikes = self.spikes.numpy()
@@ -328,15 +433,16 @@ class Maze(object):
     
     # method for plotting position data
     def plot_position(self, plot_map = False, plot_over_time = False, directory = None):
-        x_pos, y_pos = self.x_pos.numpy(), self.y_pos.numpy()
+        x_pos, y_pos = self.pos[:,0].numpy(), self.pos[:,1].numpy()
         n_points = x_pos.shape[0]
-        Fs = self.info['Fs']
         
         # plot x-y view map
         if plot_map:
             plt.figure()
             idx = [0, n_points*.1, n_points*.2, n_points*.3, n_points*.4, n_points*.5, 
                    n_points*.6, n_points*.7, n_points*.8, n_points*.9, n_points-1]
+            
+            Fs = 30
             
             plt.plot(x_pos, y_pos, '0.4')
             for i in idx:
@@ -345,9 +451,10 @@ class Maze(object):
                     't=%.3fs' % (int(i)/Fs),
                     fontsize = 8, color = 'blue'
                     )
+            name, session = self.info['name'], self.info['session']
             plt.xlabel('X axis')
             plt.ylabel('Y axis')
-            plt.title('Rat Position (X-Y view)')
+            plt.title(f'{name} Position (X-Y view) | Session: {session}')
             plt.show()
         
         # plot x and y independently versus time
@@ -364,37 +471,87 @@ class Maze(object):
             plt.xlabel('Time [s]')
             fig.suptitle('Rat Position vs Time')
             
-            
+
+# custom Dataset class used during model training
+class Data(Dataset):
+    
+    def __init__(self, inputs, labels):
+        self.x = inputs
+        self.y = labels
+        
+    def __len__(self):
+        return self.x.size(dim = 0)
+
+    def __getitem__(self, index):
+        xi = self.x[index,:]
+        yi = self.y[index]
+        return xi, yi
+    
+
 # class for applying range normalize transform to position data
 class RangeNormalize(object):
     
-    def __init__(self, velocity_data = False):
+    def __init__(self, dim, norm_mode = 'auto', velocity_data = False):
+        if norm_mode == 'auto':
+            self.norm_mode = [0 for i in range(dim)]
+        else:
+            self.norm_mode = norm_mode
         self.velocity_data = velocity_data
         
     # method for fitting transform object
-    def fit(self, data = None, pos_mins = None, pos_maxs = None):
+    def fit(self, data = None, range_min = None, range_max = None):
         if data is not None:
-            if self.velocity_data:
-                self.pos_mins, _ = data[:,-1,:2].min(dim = 0)
-                self.pos_maxs, _ = data[:,-1,:2].max(dim = 0)
-        
-                self.vel_mean = data[:,-1,2:].mean(dim = 0)
-                self.vel_std  = data[:,-1,2:].std(dim = 0)
+            if data.dim() == 2:
+                data = deepcopy(data).unsqueeze(1)
+                
+# =============================================================================
+#             if self.velocity_data:        
+#                 self.vel_mean = data[:,-1,2:].mean(dim = 0)
+#                 self.vel_std  = data[:,-1,2:].std(dim = 0)
+# =============================================================================
+            
+            if range_min is None:
+                self.range_min = data[:,-1,:].min(dim = 0)[0]
             else:
-                self.pos_mins, _ = data[:,-1,:].min(dim = 0)
-                self.pos_maxs, _ = data[:,-1,:].max(dim = 0)
+                self.range_min = torch.tensor(range_min)
+            if range_max is None:
+                self.range_max = data[:,-1,:].max(dim = 0)[0]
+            else:
+                self.range_max = torch.tensor(range_max)
         else:
-            self.pos_mins = pos_mins
-            self.pos_maxs = pos_maxs
+            self.range_min = torch.tensor(range_min)
+            self.range_max = torch.tensor(range_max)
+        
+        self.loc = torch.zeros_like(self.range_min)
+        scale = torch.ones_like(self.range_min)
+        for i in range(self.loc.size(0)):
+            if self.norm_mode[i] == 0:
+                self.loc[i] = self.range_min[i]
+                
+            elif self.norm_mode[i] == 1:
+                self.loc[i] = (self.range_min[i]+self.range_max[i])/2
+                scale[i] = 2
+        
+        self.scale = (self.range_max - self.range_min) / scale
+        
             
     # method for applying transform to position data
     def transform(self, data):
         new_data = deepcopy(data.detach())
-        if self.velocity_data:
-            new_data[:,:,:2] = (data[:,:,:2] - self.pos_mins) / (self.pos_maxs - self.pos_mins)
-            new_data[:,:,2:] = (data[:,:,2:] - self.vel_mean) / self.vel_std
-        else:
-            new_data = (data - self.pos_mins) / (self.pos_maxs - self.pos_mins)
+        
+        if data.dim() == 2:
+            new_data = new_data.unsqueeze(1)
+        
+# =============================================================================
+#         if self.velocity_data:
+#             new_data[:,:,:2] = (new_data[:,:,:2] - self.range_min) / (self.range_max - self.range_min)
+#             new_data[:,:,2:] = (new_data[:,:,2:] - self.vel_mean) / self.vel_std
+#         else:
+# =============================================================================
+        new_data = (new_data - self.loc) / self.scale
+        
+        if data.dim() == 2:
+            new_data = new_data.squeeze(1)
         return new_data
     
     # method that runs fit and transform on position data
@@ -405,17 +562,31 @@ class RangeNormalize(object):
     # method for untransforming transformed data
     def untransform(self, data, variance = None):
         new_data = deepcopy(data.detach())
-        if self.velocity_data:
-            new_data[:,:,:2] = data[:,:,:2] * (self.pos_maxs - self.pos_mins) + self.pos_mins
-            new_data[:,:,2:] = data[:,:,2:] * self.vel_std + self.vel_mean
-        else:
-            new_data = data * (self.pos_maxs - self.pos_mins) + self.pos_mins
-            
+        
+        if data.dim() == 2:
+            new_data = new_data.unsqueeze(1)
+        
+# =============================================================================
+#         if self.velocity_data:
+#             new_data[:,:,:2] = new_data[:,:,:2] * (self.range_max - self.range_min) + self.range_min
+#             new_data[:,:,2:] = new_data[:,:,2:] * self.vel_std + self.vel_mean
+#         else:
+# =============================================================================
+        new_data = new_data * self.scale + self.loc
+        
+        if data.dim() == 2:
+            new_data = new_data.squeeze()
+        
         if variance == None:
             return new_data
-        else:
-            new_var = variance * (self.pos_maxs - self.pos_mins)
-            return new_data, new_var
+        
+        else:            
+            variance *= self.scale
+# =============================================================================
+#             if self.velocity_data:
+#                 variance[:,:,2:] *= self.vel_std
+# =============================================================================
+            return new_data, variance.squeeze()
         
         
 # class for applying one type of arm-dist transform to position data
@@ -588,7 +759,10 @@ class WMazeDiscreteTransform2(object):
         self.range_norm = range_norm
         
     # method for fitting transform object
-    def fit(self, data):        
+    def fit(self, data):
+        if data.dim() == 2:
+            data = deepcopy(data).unsqueeze(1)
+        
         self.center = torch.zeros((4,))
         c = [[],[],[],[]]
         
@@ -611,6 +785,9 @@ class WMazeDiscreteTransform2(object):
             
     # method for transforming position data
     def transform(self, data):
+        if data.dim() == 2:
+            data = deepcopy(data).unsqueeze(1)
+        
         m = torch.zeros((4,))
         m[0] = -1
         m[1] = 1
@@ -655,7 +832,7 @@ class WMazeDiscreteTransform2(object):
         if self.range_norm:
             new_data[:,:,5] /= self.range
         
-        return new_data
+        return new_data.squeeze()
                 
     # method that runs fit and transform on position data
     def fit_transform(self, data):
@@ -664,6 +841,9 @@ class WMazeDiscreteTransform2(object):
     
     # method for untransforming transformed position data
     def untransform(self, data, variance = None):
+        if data.dim() == 2:
+            data = deepcopy(data.detach()).unsqueeze(1)
+        
         new_data = torch.zeros((data.size(0), data.size(1), 2))
         
         for i in range(data.size(0)):
@@ -706,7 +886,7 @@ class WMazeDiscreteTransform2(object):
                     
                     
         if variance == None:
-            return new_data
+            return new_data.squeeze()
         else:
             new_var = torch.zeros((variance.size(0), 2))
             for i in range(variance.size(0)):
@@ -720,9 +900,125 @@ class WMazeDiscreteTransform2(object):
             if self.range_norm:
                 new_var *= self.range
             
-            return new_data, new_var
+            return new_data.squeeze(), new_var
     
+
+# Bon:
+#   line1_intercept: -100 | line2_intercept: 330
+#   bound1: 195 | bound2: 235
+
+# class for applying a third transform specialized for the W-maze datasets
+class WMazeTransform(object):
     
+    # optionally range normalize position data before fitting and applying transform
+    def __init__(
+            self, 
+            line1_intercept, line2_intercept, 
+            x1_bound, x2_bound,
+            range_normalize = False,
+            xmin = None, xmax = None, ymin = None, ymax = None, 
+            ):
+        self.x = (xmin, xmax)
+        self.y = (ymin, ymax)
+        self.m = (1, -1)
+        self.b = (line1_intercept, line2_intercept)
+        self.bound = (x1_bound, x2_bound)
+        self.norm = range_normalize
+        
+        if range_normalize:
+            self.range = torch.tensor([xmax-xmin,ymax-ymin])
+            self.range_min = torch.tensor([xmin,ymin])
+        
+    def rotate(self, point, m, dy):
+        return torch.cat([(point[0]-m*dy).view(-1), (point[1]-dy).view(-1)], dim = 0)
     
+    # method for transforming position data
+    def transform(self, data):
+        data = deepcopy(data)
+        if data.dim() == 2:
+            data = data.unsqueeze(1)
+        
+        for i in range(data.size(0)):
+            for j in range(data.size(1)):
+                dy = -1
+                if data[i,j,0] < self.bound[0]:
+                    m = self.m[0]
+                    dy = data[i,j,1] - (self.m[0] * data[i,j,0] + self.b[0])
+                elif data[i,j,0] > self.bound[1]:
+                    m = self.m[1]
+                    dy = data[i,j,1] - (self.m[1] * data[i,j,0] + self.b[1])
+                
+                if dy > 0:
+                    data[i,j,:] = self.rotate(data[i,j,:], m, dy)
+        
+        if self.norm:
+            data[:,:,0] = (data[:,:,0] - self.range_min[0]) / self.range[0]
+            data[:,:,1] = (data[:,:,1] - self.range_min[1]) / self.range[1]
+        
+        return data.squeeze()
     
+    def unrotate(self, point, m, dx):
+        return torch.cat([(point[0]+m*dx).view(-1), (point[1]+dx).view(-1)], dim = 0)
+        
+    # method for untransforming transformed position data
+    def untransform(self, data, variance = None):
+        if data.dim() == 2:
+            data = deepcopy(data.detach()).unsqueeze(1)
+        if variance is not None:
+            variance = deepcopy(variance.detach())
+            if variance.dim() == 2:
+                variance = variance.unsqueeze(1)
+        
+        if self.norm:
+            data[:,:,0] = (data[:,:,0] * self.range[0]) + self.range_min[0]
+            data[:,:,1] = (data[:,:,1] * self.range[1]) + self.range_min[1]
+        
+        for i in range(data.size(0)):
+            for j in range(data.size(1)):
+                dx = -1
+                if data[i,j,0] < self.bound[0]:
+                    m = self.m[0]
+                    dx = ((data[i,j,1] - self.b[0]) / self.m[0]) - data[i,j,0]
+                elif data[i,j,0] > self.bound[1]:
+                    m = self.m[1]
+                    dx = data[i,j,0] - ((data[i,j,1] - self.b[1]) / self.m[1])
+                
+                if dx > 0:
+                    data[i,j,:] = self.unrotate(data[i,j,:], m, dx)
+                    if variance is not None:
+                        variance[i,j,:] = variance[i,j,:].flip(0)
+        
+        if self.norm and variance is not None:
+            variance[:,:,0] *= self.range[0]
+            variance[:,:,1] *= self.range[1]
+                    
+        if variance == None:
+            return data.squeeze()
+        else:
+            
+            return data.squeeze(), variance.squeeze()
+    
+
+# =============================================================================
+# wm = Maze(
+#     name = 'Jaq', 
+#     session = (1,3),
+#     n_points = 'all', 
+#     )
+# 
+# print(len(wm.spike_times), wm.spike_counts.size(), wm.pos.size())
+# =============================================================================
+
+
+# =============================================================================
+# wm = Maze(
+#     name = 'Remy', 
+#     session = (35,1), 
+#     n_points = 'all', 
+#     )
+# =============================================================================
+
+
+
+
     
