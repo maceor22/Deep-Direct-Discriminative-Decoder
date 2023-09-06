@@ -8,7 +8,6 @@ from torch.distributions.multivariate_normal import MultivariateNormal
 import numpy as np
 import time as time
 
-inq
 
 
 class LTC(nn.Module):
