@@ -512,7 +512,7 @@ def generate_dataset(
                 spike_history_length = spike_history_length, spike_bin_size = spike_bin_size, 
                 position_history_length = position_history_length, shuffle = False,
                 )
-            if phl > 0 and not include_velocity:
+            if position_history_length > 0 and not include_velocity:
                 new_labels = get_position_delta(new_labels, return_mean = True).flatten(1,-1)
             inputs.append(new_inputs)
             labels.append(new_labels)
@@ -632,7 +632,7 @@ def pretrain_density_mixture_network(
     
     optimizer = torch.optim.SGD(mixture_network.parameters(), lr = 1e-3)
     
-    for epoch in range(1,epochs+1):        
+    """ for epoch in range(1,epochs+1):        
         train_loss = 0
         valid_loss = 0
         
@@ -697,12 +697,12 @@ def pretrain_density_mixture_network(
             
             # iterate over validation data
             while upper <= valid_z.size(0):
-                input_batch = valid_input[ix[lower:upper]]
+                input_batch = valid_input[ix[lower:upper]].to(device)
                 
                 #pi_target = valid_z[ix[lower:upper]]
-                pi_target = tr_pi_target[ix[lower:upper]]
-                mu_target = va_mu_target[ix[lower:upper]]
-                var_target = va_var_target[ix[lower:upper]]
+                pi_target = tr_pi_target[ix[lower:upper]].to(device)
+                mu_target = va_mu_target[ix[lower:upper]].to(device)
+                var_target = va_var_target[ix[lower:upper]].to(device)
                 
                 if covariance_type == 'diag':
                     samp = Normal(mu_target, var_target**0.5).sample()
@@ -776,7 +776,7 @@ def pretrain_density_mixture_network(
         plt.legend()
         plt.show()
         
-    return best_epoch, train_losses, valid_losses
+    return best_epoch, train_losses, valid_losses """
     
 
 
@@ -971,11 +971,11 @@ if __name__ == '__main__':
             covariance_type = 'full', 
             train_input = train_input, train_label = train_label, 
             valid_input = valid_input, valid_label = valid_label,
-            epochs = 2000, plot_losses = True,
+            epochs = 30, plot_losses = True,
             )
-        torch.save(JointProbXY.state_dict(),
+        """ torch.save(JointProbXY.state_dict(),
                    f'ObservationModels/pretrained/HL{shl}_BS{bs}_2layerMVNMMLP_{JointProbXY.num_mixtures}mix_JointProbXY_hid24.pt')
-        
+         """
 
 # =============================================================================
 #         trainer = TrainerExpectationMaximization(

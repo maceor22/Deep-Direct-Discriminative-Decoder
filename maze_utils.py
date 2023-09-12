@@ -224,7 +224,7 @@ class Maze(object):
                 print(posRaw, posRaw.shape)
         
         elif name == 'Bon':
-            spikesFile = sio.loadmat(f'Datasets/SunMaze/Bon/Bonspikes0{session[0]}.mat')['spikes'][0][-1][0][session[1]][0]#[11]#[0][0]#[0][0][0][:,-1]
+            spikesFile = sio.loadmat(f'Datasets/SunMaze/Bon/bonspikes0{session[0]}.mat')['spikes'][0][-1][0][session[1]][0]#[11]#[0][0]#[0][0][0][:,-1]
             #print(spikesFile, spikesFile.shape)
             
             rem = [10, 20, 26, 27, 31]
@@ -243,7 +243,7 @@ class Maze(object):
                                 dat.append(c[0][:,0])
                             ix += 1
                             
-            posRaw = mat73.loadmat(f'Datasets/SunMaze/Bon/Bonpos0{session[0]}.mat')['pos'][-1][session[1]]['data'][:,:5]
+            posRaw = mat73.loadmat(f'Datasets/SunMaze/Bon/bonpos0{session[0]}.mat')['pos'][-1][session[1]]['data'][:,:5]
         
         
         elif name == 'Emile':

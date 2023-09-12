@@ -582,7 +582,7 @@ class MultivariateNormalMixtureMLP(nn.Module):
         
         cholesky_tril = torch.zeros((
             tril_components.size(0), self.num_mixtures, self.latent_dim, self.latent_dim,
-            ))
+            ), device = tril_components.device)
         for k in range(self.num_mixtures):
             idx = 0
             for i in range(self.latent_dim):
