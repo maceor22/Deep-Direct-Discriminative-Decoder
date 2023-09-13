@@ -469,7 +469,7 @@ class GaussianMixtureMLP(nn.Module):
             nn.Softmax(dim = 1),
             )
         self.mu = nn.Linear(layer_sizes[-1], num_mixtures*latent_dim)
-        self.log_var = nn.Linear(layer_sizes[-1], num_mixtures*latent_dim)        
+        self.log_sigma = nn.Linear(layer_sizes[-1], num_mixtures*latent_dim)        
     
     # needs to be updated, does not affect model performance
     def load_parameters(self, params):
@@ -502,37 +502,36 @@ class GaussianMixtureMLP(nn.Module):
         x = self.lin(x)
         pi_k = self.pi(x).view(-1, self.num_mixtures)
         mu_k = self.mu(x).view(-1, self.num_mixtures, self.latent_dim).nan_to_num(nan = torch.rand(1).item())
-        var_k = torch.exp(self.log_var(x).view(-1, self.num_mixtures, self.latent_dim)).nan_to_num(nan = torch.rand(1).item())
-        return pi_k, mu_k, var_k
+        sigma_k = torch.exp(self.log_sigma(x).view(-1, self.num_mixtures, self.latent_dim)).nan_to_num(nan = torch.rand(1).item())
+        return pi_k, mu_k, sigma_k
         
     # method for optionally producing prediction distribution or sample from distribution
     def predict(self, x, return_sample = True):
-        pi_k, mu_k, var_k = self.forward(x)
+        pi_k, mu_k, sigma_k = self.forward(x)
         
         for i in range(x.size(0)):
             for k in range(self.num_mixtures):
                 mu_k[i,k,:] *= pi_k[i,k]
-                var_k[i,k,:] *= pi_k[i,k]
+                sigma_k[i,k,:] *= pi_k[i,k]
         mu = mu_k.sum(dim = 1)
-        var = var_k.sum(dim = 1)
+        sigma = sigma_k.sum(dim = 1)
         
         if return_sample: 
-            noise = Normal(torch.zeros_like(mu), var).sample()
-            mu += noise
+            noise = Normal(torch.zeros_like(mu), sigma).sample()
             # return sample
-            return mu
+            return mu + noise
         else:
-            # return prediction mean and prediction variance
-            return mu, var
+            # return prediction mean and prediction standard deviation
+            return mu, sigma
         
         
     def expect(self, x, target):        
-        pi_k, mu_k, var_k = self.forward(x)
+        pi_k, mu_k, sigma_k = self.forward(x)
         
         expectation = torch.zeros((x.size(0)), requires_grad = True)
         
         for k in range(self.num_mixtures):
-            gauss = Normal(loc = mu_k[:,k,:], scale = var_k[:,k,:])
+            gauss = Normal(loc = mu_k[:,k,:], scale = sigma_k[:,k,:])
             
             probs = torch.exp(gauss.log_prob(
                 target).view(-1,self.latent_dim).mean(dim = 1))
@@ -645,11 +644,10 @@ class MultivariateNormalMixtureMLP(nn.Module):
             noise = MultivariateNormal(
                 loc = torch.zeros_like(mu), covariance_matrix = sigma
                 ).sample()
-            mu += noise
             # return sample
-            return mu
+            return mu + noise
         else:
-            # return prediction mean and prediction variance
+            # return prediction mean and prediction covariance
             if scale_tril:
                 return mu, torch.linalg.cholesky(sigma)
             else:
