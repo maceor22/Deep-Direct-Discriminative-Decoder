@@ -1,15 +1,12 @@
-from copy import deepcopy
 from maze_utils import *
+from bayesian import BayesLinear
+from ltc import LTC
 import matplotlib.pyplot as plt
 import torch
-from torch import nn as nn
-from torch import autograd as ag
-from torch.distributions.normal import Normal
-from torch.distributions.multivariate_normal import MultivariateNormal
-from torch.utils.data import DataLoader
-from torch.nn.utils import clip_grad_norm_, clip_grad_value_
-import numpy as np
+from torch import nn
+from torch.distributions import Binomial, Normal, MultivariateNormal
 import time as time
+from memory_profiler import profile
 
 
 # random walk model
@@ -24,33 +21,29 @@ class RandomWalk(nn.Module):
         self.covar = covar
 
     def forward(self, x, var = None):
-        x = x[:,-3:-1]
-        
         if var is None:
-            return MultivariateNormal(x, self.covar).sample()
+            return MultivariateNormal(x.squeeze(1), self.covar).sample()
         else:
             covar = torch.zeros((2,2))
             covar[0,0] = var[0]
             covar[1,1] = var[1]
             return MultivariateNormal(x, covar).sample()
-            
     
     def predict(self, x, var = None):
-        return self.forward(x, var)
-
+        return self.forward(x[:,:,:2], var)
 
 
 # MLP classifier generating probability that next timestep is in each class
 class ClassifierMLP(nn.Module):
     
-    def __init__(self, hidden_layer_sizes, input_dim, num_classes):
+    def __init__(self, hidden_layer_sizes, input_dim, latent_dim):
         # hidden_layer_sizes: list or tuple containing hidden layer sizes
         # num_arms: number of arms in discrete transform
         # input_dim: input dimension to model
         
         super(ClassifierMLP, self).__init__()
         
-        self.num_classes = num_classes
+        self.latent_dim = latent_dim
         
         layer_sizes = hidden_layer_sizes
         layer_sizes.insert(0, input_dim)
@@ -60,32 +53,104 @@ class ClassifierMLP(nn.Module):
         for i in range(1,len(layer_sizes)):
             layers.append(nn.Linear(layer_sizes[i-1], layer_sizes[i]))
             layers.append(nn.ReLU())
-        layers.append(nn.Linear(layer_sizes[-1], self.num_classes))
+        layers.append(nn.Linear(layer_sizes[-1], self.latent_dim))
         
         self.lin = nn.Sequential(*layers)
         self.final = nn.LogSoftmax(dim = 1)
         
     # forward call
     def forward(self, x):
-        return self.final(self.lin(x))
+        return self.final(self.lin(x.flatten(1,-1)))
     
     # method returning optionally output arm or log probability values for each arm
-    def predict(self, x, return_log_probs = False):
-        if return_log_probs:
+    def predict(self, x, return_sample = True):
+        if not return_sample:
             return self.forward(x)
         else:
             x = self.forward(x)
             x = torch.argmax(x, dim = 1)
-            out = torch.zeros((x.size(0),self.num_classes))
+            out = torch.zeros((x.size(0),self.latent_dim), device = x.device)
             for i in range(x.size(0)):
                 out[i,x[i]] = 1
             return out
+        
+
+class BinomialMLP(nn.Module):
+    
+    def __init__(
+            self, hidden_layer_sizes, input_dim, latent_dim,
+            n_trials, log_target = False,
+        ):
+        # hidden_layer_sizes: list or tuple containing hidden layer sizes
+        # num_arms: number of arms in discrete transform
+        # input_dim: input dimension to model
+        
+        super(BinomialMLP, self).__init__()
+        
+        self.latent_dim = latent_dim
+        self.n_trials = n_trials
+        self.log_target = log_target
+        
+        layer_sizes = hidden_layer_sizes
+        layer_sizes.insert(0, input_dim)
+        
+        # build hidden layers with ReLU activation function in between
+        layers = []
+        for i in range(1,len(layer_sizes)):
+            layers.append(nn.Linear(layer_sizes[i-1], layer_sizes[i]))
+            layers.append(nn.ReLU())
+        layers.append(nn.Linear(layer_sizes[-1], self.latent_dim))
+        
+        self.lin = nn.Sequential(*layers)
+        self.final = nn.LogSigmoid()
+        
+    # forward call
+    def forward(self, x):
+        x = self.lin(x.flatten(1,-1))
+        logits = self.final(x).nan_to_num(nan = -10, posinf = -10, neginf = -10)
+        return logits
+    
+    # method returning optionally output arm or log probability values for each arm
+    def predict(self, x, return_sample = True):
+        logits = self.forward(x)
+        
+        if return_sample:
+            pred = Binomial(total_count = self.n_trials, logits = logits).sample()
+        else:
+            pred = self.n_trials * logits.exp()
+        
+        if self.log_target:
+            pred = torch.log(pred + 1)
+        
+        return pred
+        
+    def prob(self, x, target, reduction = 'mean'):
+        if self.log_target:
+            target = (target.exp() - 1).long()
+        
+        logits = self.forward(x)
+
+        log_probs = Binomial(
+            total_count = self.n_trials, logits = logits,
+            ).log_prob(target).view(-1,self.latent_dim)
+        
+        if reduction == 'joint':
+            probs = log_probs.sum(dim = 1).exp()
+        elif reduction == 'mean':
+            probs = log_probs.exp().mean(dim = 1)
+        
+        return probs
+
 
 
 # MLP generative model producing prediction distribution of next timestep
 class GaussianMLP(nn.Module):
     
-    def __init__(self, hidden_layer_sizes, input_dim, latent_dim):
+    def __init__(
+            self, hidden_layer_sizes, 
+            input_dim, latent_dim, 
+            #epsilon = 1e-40,
+            ):
         # hidden_layer_sizes: list or tuple containing hidden layer sizes
         # input_dim: dimension of input to the model
         
@@ -102,8 +167,10 @@ class GaussianMLP(nn.Module):
         
         self.layer_sizes = layer_sizes
         self.latent_dim = latent_dim
+        #self.epsilon = epsilon
         self.lin = nn.Sequential(*layers)
-        self.final = nn.Linear(layer_sizes[-1], latent_dim*2)
+        self.mu = nn.Linear(layer_sizes[-1], latent_dim)
+        self.log_sigma = nn.Linear(layer_sizes[-1], latent_dim)
     
     def load_parameters(self, params):
         lower = 0
@@ -132,22 +199,85 @@ class GaussianMLP(nn.Module):
     
     # forward call
     def forward(self, x):
-        return self.final(self.lin(x))
+        x = self.lin(x.flatten(1,-1))
+        mu = self.mu(x)
+        sigma = torch.exp(self.log_sigma(x)) #+ self.epsilon
+        return mu, sigma
         
     # method for optionally producing prediction distribution or sample from distribution
     def predict(self, x, return_sample = True):
-        out = self.forward(x)
+        mu, sigma = self.forward(x)
         
         if return_sample:            
-            samp = Normal(
-                torch.zeros((out.size(0),self.latent_dim)), 
-                torch.exp(out[:,self.latent_dim:])**0.5).sample()
-            out[:,:self.latent_dim] += samp
+            noise = Normal(torch.zeros_like(mu), sigma).sample()
             # return sample
-            return out[:,:self.latent_dim]
+            return mu + noise
         else:
             # return prediction mean and prediction variance
-            return out[:,:self.latent_dim], torch.exp(out[:,self.latent_dim:])
+            return mu, sigma
+    
+
+    def prob(self, x, y):
+        mu, sigma = self.forward(x)
+
+        log_probs = torch.zeros((x.size(0)), requires_grad = True, device = x.device)
+
+        for i in range(self.latent_dim):
+            log_probs = log_probs + Normal(mu[:,i], sigma[:,i]).log_prob(y[:,i])
+        
+        return log_probs.exp()
+
+
+class GaussianBayesMLP(nn.Module):
+
+    def __init__(
+            self, hidden_layer_sizes, input_dim, latent_dim,
+            parameter_distribution = 'gaussian',
+        ):
+        # hidden_layer_sizes: list or tuple containing hidden layer sizes
+        # input_dim: dimension of input to the model
+        
+        super(GaussianBayesMLP, self).__init__()
+        
+        layer_sizes = hidden_layer_sizes
+        layer_sizes.insert(0, input_dim)
+        
+        # build hidden layers with ReLU activation function in between
+        layers = []
+        for i in range(1,len(layer_sizes)):
+            layers.append(BayesLinear(
+                layer_sizes[i-1], layer_sizes[i], parameter_distribution,
+            ))
+            layers.append(nn.ReLU())
+        
+        self.layer_sizes = layer_sizes
+        self.latent_dim = latent_dim
+        self.lin = nn.Sequential(*layers)
+        self.mu = BayesLinear(layer_sizes[-1], latent_dim, parameter_distribution)
+        self.log_sigma = BayesLinear(layer_sizes[-1], latent_dim, parameter_distribution)
+    
+    # TBD
+    def load_parameters(self, params):
+        pass
+    
+    # forward call
+    def forward(self, x):
+        x = self.lin(x.flatten(1,-1))
+        mu = self.mu(x)
+        sigma = torch.exp(self.log_sigma(x))
+        return mu, sigma
+        
+    # method for optionally producing prediction distribution or sample from distribution
+    def predict(self, x, return_sample = True):
+        mu, sigma = self.forward(x)
+        
+        if return_sample:            
+            noise = Normal(torch.zeros_like(mu), sigma).sample()
+            # return sample
+            return mu + noise
+        else:
+            # return prediction mean and prediction variance
+            return mu, sigma
 
 
 # MLP generative model producing prediction distribution of next timestep
@@ -179,7 +309,10 @@ class MultivariateNormalMLP(nn.Module):
     def format_cholesky_tril(self, tril_components):
         tril_components = tril_components.view(-1, self.num_tril_components)
         
-        cholesky_tril = torch.zeros((tril_components.size(0), self.latent_dim, self.latent_dim))
+        cholesky_tril = torch.zeros(
+            (tril_components.size(0), self.latent_dim, self.latent_dim),
+            device = tril_components.device,
+            )
         idx = 0
         for i in range(self.latent_dim):
             for j in range(i+1):
@@ -191,35 +324,13 @@ class MultivariateNormalMLP(nn.Module):
         
         return cholesky_tril
     
-    # ...
+    # TBD
     def load_parameters(self, params):
-        lower = 0
-        ix = 0
-        for layer in self.lin:
-            if type(layer) == nn.modules.linear.Linear:
-                upper = lower + self.layer_sizes[ix]*self.layer_sizes[ix+1]
-                weight = params[lower:upper].reshape(self.layer_sizes[ix], self.layer_sizes[ix+1])
-                
-                lower = upper
-                upper += self.layer_sizes[ix+1]
-                bias = params[lower:upper]
-                
-                layer.weight = nn.Parameter(weight)
-                layer.bias = nn.Parameter(bias)
-                
-                lower = upper
-                ix += 1
-        
-        upper += self.layer_sizes[-1]*self.latent_dim*2
-        weight = params[lower:upper].reshape(self.layer_sizes[-1], self.latent_dim*2)
-        bias = params[upper:]
-        
-        self.final.weight = nn.Parameter(weight)
-        self.final.bias = nn.Parameter(bias)
+        pass
     
     # forward call
     def forward(self, x):
-        x = self.lin(x)
+        x = self.lin(x.flatten(1,-1))
         mu = self.mu(x)
         cholesky_tril = self.format_cholesky_tril(self.tril_components(x))
         return mu, cholesky_tril
@@ -228,13 +339,12 @@ class MultivariateNormalMLP(nn.Module):
     def predict(self, x, return_sample = True, scale_tril = False):
         mu, cholesky_tril = self.forward(x)
         
-        if return_sample:            
-            samp = MultivariateNormal(
-                torch.zeros_like(mu), 
-                scale_tril = cholesky_tril,
-                ).sample()
-            # return sample
-            return mu + samp
+        if return_sample:
+            sample = MultivariateNormal(mu, scale_tril = cholesky_tril).sample()
+            if mu.requires_grad:
+                return sample.requires_grad_()
+            else:
+                return sample
         else:
             # return prediction mean and prediction variance
             if scale_tril:
@@ -336,6 +446,59 @@ class GaussianCNN(nn.Module):
         
 
 
+class GaussianLTC(nn.Module):
+
+    def __init__(
+            self, hidden_layer_size, num_layers,
+            sequence_dim, feature_dim, latent_dim,
+            last_hidden_state = False,
+            use_cell_memory = False, solver_unfolds = 6, 
+            ):
+        
+        super(GaussianLTC, self).__init__()
+
+        self.ltc = LTC(
+            input_dim = feature_dim, hidden_dim = hidden_layer_size, num_layers = num_layers,
+            use_cell_memory = use_cell_memory, ode_solver_unfolds = solver_unfolds,
+            )
+        
+        self.mu = nn.Linear(
+            in_features = hidden_layer_size if last_hidden_state else sequence_dim*hidden_layer_size, 
+            out_features = latent_dim,
+            )
+        self.log_sigma = nn.Linear(
+            in_features = hidden_layer_size if last_hidden_state else sequence_dim*hidden_layer_size, 
+            out_features = latent_dim,
+            )
+        
+        self.seq_dim = sequence_dim
+        self.hid_dim = hidden_layer_size
+        self.last_hidden = last_hidden_state
+
+    
+    def forward(self, x):
+        hidden_state = self.ltc(x)[0].view(-1, self.seq_dim, self.hid_dim)
+
+        if self.last_hidden:
+            hidden_state = hidden_state[:,-1,:]
+        else:
+            hidden_state = hidden_state.flatten(1,-1)            
+
+        mu = self.mu(hidden_state)
+        sigma = torch.exp(self.log_sigma(hidden_state))
+
+        return mu, sigma
+    
+
+    def predict(self, x, return_sample = True):
+        mu, sigma = self.forward(x)
+
+        if return_sample:
+            return Normal(mu, sigma).sample()
+        else:
+            return mu, sigma
+
+
 class MultivariateNormalMixture(object):
     
     def __init__(
@@ -378,7 +541,7 @@ class MultivariateNormalMixture(object):
         nlls = []
         delta_norms = []
         
-        for i in range(max_iter):    
+        for _ in range(max_iter):    
             g, nll = self.gamma()
             
             sum_g = g.sum(dim = 0)
@@ -425,7 +588,6 @@ class MultivariateNormalMixture(object):
             ax[1].plot(range(1,len(delta_norms)+1), delta_norms, 'k')
             ax[1].set_ylabel('delta theta\ninf norm')
             
-        
     
     def gamma(self):
         g = torch.zeros((self.N, self.num_mixtures))
@@ -471,77 +633,77 @@ class GaussianMixtureMLP(nn.Module):
         self.mu = nn.Linear(layer_sizes[-1], num_mixtures*latent_dim)
         self.log_sigma = nn.Linear(layer_sizes[-1], num_mixtures*latent_dim)        
     
-    # needs to be updated, does not affect model performance
+    # TBD
     def load_parameters(self, params):
-        lower = 0
-        ix = 0
-        for layer in self.lin:
-            if type(layer) == nn.modules.linear.Linear:
-                upper = lower + self.layer_sizes[ix]*self.layer_sizes[ix+1]
-                weight = params[lower:upper].reshape(self.layer_sizes[ix], self.layer_sizes[ix+1])
-                
-                lower = upper
-                upper += self.layer_sizes[ix+1]
-                bias = params[lower:upper]
-                
-                layer.weight = nn.Parameter(weight)
-                layer.bias = nn.Parameter(bias)
-                
-                lower = upper
-                ix += 1
-        
-        upper += self.layer_sizes[-1]*self.latent_dim*2
-        weight = params[lower:upper].reshape(self.layer_sizes[-1], self.latent_dim*2)
-        bias = params[upper:]
-        
-        self.final.weight = nn.Parameter(weight)
-        self.final.bias = nn.Parameter(bias)
+        pass
     
     # forward call
     def forward(self, x):
-        x = self.lin(x)
+        x = self.lin(x.flatten(1,-1))
         pi_k = self.pi(x).view(-1, self.num_mixtures)
         mu_k = self.mu(x).view(-1, self.num_mixtures, self.latent_dim).nan_to_num(nan = torch.rand(1).item())
         sigma_k = torch.exp(self.log_sigma(x).view(-1, self.num_mixtures, self.latent_dim)).nan_to_num(nan = torch.rand(1).item())
         return pi_k, mu_k, sigma_k
         
     # method for optionally producing prediction distribution or sample from distribution
-    def predict(self, x, return_sample = True):
+    def predict(self, x, return_sample = True, method = 'sample'):
         pi_k, mu_k, sigma_k = self.forward(x)
+
+        if method == 'sample':
+            k = pi_k.multinomial(num_samples = 1).squeeze(1)
         
-        for i in range(x.size(0)):
-            for k in range(self.num_mixtures):
-                mu_k[i,k,:] *= pi_k[i,k]
-                sigma_k[i,k,:] *= pi_k[i,k]
-        mu = mu_k.sum(dim = 1)
-        sigma = sigma_k.sum(dim = 1)
+        elif method == 'dominant':
+            k = pi_k.argmax(dim = 1)
+
+        if method == 'sample' or method == 'dominant':
+            mu = torch.stack([mu_k[i,k[i],:] for i in range(k.size(0))], dim = 0)
+            sigma = torch.stack([sigma_k[i,k[i],:] for i in range(k.size(0))], dim = 0)
+        
+        elif method == 'average':
+            for i in range(x.size(0)):
+                for k in range(self.num_mixtures):
+                    mu_k[i,k,:] *= pi_k[i,k]
+                    sigma_k[i,k,:] *= pi_k[i,k]
+            mu = mu_k.sum(dim = 1)
+            sigma = sigma_k.sum(dim = 1)
         
         if return_sample: 
-            noise = Normal(torch.zeros_like(mu), sigma).sample()
-            # return sample
-            return mu + noise
+            if mu.size(0) < 2000:
+                samples = Normal(mu, sigma).sample()
+            else:
+                samples = []
+                lower = 0
+                done = False
+                while not done:
+                    upper = lower + 2000
+                    if upper > mu.size(0):
+                        upper = mu.size(0)
+                    samples.append(Normal(mu[lower:upper], sigma[lower:upper]).sample())
+                    if upper == mu.size(0):
+                        done = True
+                    lower += 2000
+                samples = torch.cat(samples, dim = 0)
+            # return samples
+            return samples
         else:
-            # return prediction mean and prediction standard deviation
+            # return prediction mean and prediction variance
             return mu, sigma
         
         
-    def expect(self, x, target):        
+    def prob(self, x, target):
         pi_k, mu_k, sigma_k = self.forward(x)
-        
-        expectation = torch.zeros((x.size(0)), requires_grad = True)
-        
-        for k in range(self.num_mixtures):
-            gauss = Normal(loc = mu_k[:,k,:], scale = sigma_k[:,k,:])
-            
-            probs = torch.exp(gauss.log_prob(
-                target).view(-1,self.latent_dim).mean(dim = 1))
-            
-            expectation = expectation + probs * pi_k[:,k]
-            
-        nll = -torch.log(expectation).nan_to_num(
-            nan = -5, posinf = -5, neginf = -5).mean(dim = 0)
-        
-        return nll
+
+        probs = torch.ones((x.size(0)), requires_grad = True, device = x.device)
+
+        for i in range(self.latent_dim):
+            temp = torch.zeros((x.size(0)), requires_grad = True, device = x.device)
+            for k in range(self.num_mixtures):
+                gauss = Normal(loc = mu_k[:,k,i], scale = sigma_k[:,k,i])
+                temp += (torch.exp(gauss.log_prob(target[:,i])) * pi_k[:,k])
+
+            probs *= temp
+                    
+        return probs
         
 
 # MLP gaussian mixture model producing prediction distribution of next timestep
@@ -581,7 +743,7 @@ class MultivariateNormalMixtureMLP(nn.Module):
         
         cholesky_tril = torch.zeros((
             tril_components.size(0), self.num_mixtures, self.latent_dim, self.latent_dim,
-            ))
+            ), device = tril_components.device)
         for k in range(self.num_mixtures):
             idx = 0
             for i in range(self.latent_dim):
@@ -594,81 +756,92 @@ class MultivariateNormalMixtureMLP(nn.Module):
         
         return cholesky_tril
     
-    # needs to be updated
+    # TBD
     def load_parameters(self, params):
-        lower = 0
-        ix = 0
-        for layer in self.lin:
-            if type(layer) == nn.modules.linear.Linear:
-                upper = lower + self.layer_sizes[ix]*self.layer_sizes[ix+1]
-                weight = params[lower:upper].reshape(self.layer_sizes[ix], self.layer_sizes[ix+1])
-                
-                lower = upper
-                upper += self.layer_sizes[ix+1]
-                bias = params[lower:upper]
-                
-                layer.weight = nn.Parameter(weight)
-                layer.bias = nn.Parameter(bias)
-                
-                lower = upper
-                ix += 1
-        
-        upper += self.layer_sizes[-1]*self.latent_dim*2
-        weight = params[lower:upper].reshape(self.layer_sizes[-1], self.latent_dim*2)
-        bias = params[upper:]
-        
-        self.final.weight = nn.Parameter(weight)
-        self.final.bias = nn.Parameter(bias)
+        pass
     
     # forward call
     def forward(self, x):
-        x = self.lin(x)
+        x = self.lin(x.flatten(1,-1))
         pi_k = self.pi(x).view(-1, self.num_mixtures)
         mu_k = self.mu(x).view(-1, self.num_mixtures, self.latent_dim)
         cholesky_tril_k = self.format_cholesky_tril(self.tril_components(x))
         return pi_k, mu_k, cholesky_tril_k
         
     # method for optionally producing prediction distribution or sample from distribution
-    def predict(self, x, return_sample = True, scale_tril = False):
+    def predict(self, x, return_sample = True, scale_tril = False, method = 'sample'):
         pi_k, mu_k, cholesky_tril_k = self.forward(x)
-        sigma_k = torch.matmul(cholesky_tril_k, cholesky_tril_k.transpose(2,3))
+
+        if method == 'sample':
+            k = pi_k.multinomial(num_samples = 1).squeeze(1)
         
-        for i in range(x.size(0)):
-            for k in range(self.num_mixtures):
-                mu_k[i,k,:] *= pi_k[i,k]
-                sigma_k[i,k,:,:] *= pi_k[i,k]
-        mu = mu_k.sum(dim = 1)
-        sigma = sigma_k.sum(dim = 1)
+        elif method == 'dominant':
+            k = pi_k.argmax(dim = 1)
+
+        if method == 'sample' or method == 'dominant':
+            mu = torch.stack([mu_k[i,k[i],:] for i in range(k.size(0))], dim = 0)
+            cholesky = torch.stack([cholesky_tril_k[i,k[i],:,:] for i in range(k.size(0))], dim = 0)
+            tril = True
+
+        elif method == 'average':
+            sigma_k = cholesky_tril_k @ cholesky_tril_k.transpose(2,3)
+            for i in range(x.size(0)):
+                for k in range(self.num_mixtures):
+                    mu_k[i,k,:] *= pi_k[i,k]
+                    sigma_k[i,k,:,:] *= pi_k[i,k]
+            mu = mu_k.sum(dim = 1)
+            sigma = sigma_k.sum(dim = 1)
+            tril = False
         
         if return_sample: 
-            noise = MultivariateNormal(
-                loc = torch.zeros_like(mu), covariance_matrix = sigma
-                ).sample()
-            # return sample
-            return mu + noise
-        else:
-            # return prediction mean and prediction covariance
-            if scale_tril:
-                return mu, torch.linalg.cholesky(sigma)
+            if mu.size(0) < 2000:
+                if tril:
+                    samples = MultivariateNormal(loc = mu, scale_tril = cholesky).sample()
+                else:
+                    samples = MultivariateNormal(loc = mu, covariance_matrix = sigma).sample()
             else:
+                samples = []
+                lower = 0
+                done = False
+                while not done:
+                    upper = lower + 2000
+                    if upper > mu.size(0):
+                        upper = mu.size(0)
+                    if tril:
+                        samps = MultivariateNormal(
+                            loc = mu[lower:upper], scale_tril = cholesky[lower:upper]).sample()
+                    else:
+                        samps = MultivariateNormal(
+                            loc = mu[lower:upper], covariance_matrix = sigma[lower:upper]).sample()
+                    samples.append(samps)
+                    if upper == mu.size(0):
+                        done = True
+                    lower += 2000
+                samples = torch.cat(samples, dim = 0)
+            # return samples
+            return samples
+        else:
+            if scale_tril:
+                if not tril:
+                    cholesky = torch.linalg.cholesky(sigma)
+                return mu, cholesky
+            else:
+                # return prediction mean and prediction variance
                 return mu, sigma
         
-        
-    def expect(self, x, target):        
+    #@profile  
+    def prob(self, x, target):        
         pi_k, mu_k, cholesky_tril_k = self.forward(x)
         
-        expectation = torch.zeros((x.size(0)), requires_grad = True)
+        probs = torch.zeros((x.size(0)), requires_grad = True, device = x.device)
         
         for k in range(self.num_mixtures):
             mvn = MultivariateNormal(
                 loc = mu_k[:,k,:], scale_tril = cholesky_tril_k[:,k,:,:])
-            prob = torch.exp(mvn.log_prob(target.float()))
-            expectation = expectation + prob * pi_k[:,k]
+            temp = torch.exp(mvn.log_prob(target.float()))
+            probs = probs + temp*pi_k[:,k]
         
-        nll = -torch.log(expectation).nan_to_num(
-            nan = -5, posinf = -5, neginf = -5).mean(dim = 0)
-        
-        return nll
+        return probs
     
 
 # wrapper class for two-model framework
