@@ -1,12 +1,90 @@
+import os
 from copy import deepcopy
 from maze_utils import *
-from state_process_models import *
-from in_maze_model import InMazeModelNN, GridClassifier, generate_inside_maze_prob_history
-from data_generation import generate_trajectory_history
+from misc_plotting import *
+from in_maze_model import GridClassifier, generate_inside_maze_prob_history
+from data_generation import generate_dataset, generate_trajectory_history
+from models import *
+from trainers import *
 import matplotlib.pyplot as plt
 import torch
 from torch import nn as nn
+from torch.distributions import Normal
+import datetime
            
+
+class StateProcess(nn.Module):
+
+    def __init__(
+            self, maze_classifier, transition_model, 
+            history_length, mode = 1,
+        ):
+
+        super(StateProcess, self).__init__()
+
+        self.clf = maze_classifier
+        self.transition = transition_model
+        self.history_length = history_length
+        self.mode = mode
+
+    def resample(self, xi):
+        done = False
+        resample_steps = 0
+        while not done:
+            samp = self.transition.predict(xi)
+            if self.clf(samp) == self.mode:
+                done = True
+            resample_steps += 1
+
+            if resample_steps % 100 == 0:
+                done = True
+
+        return samp, resample_steps
+
+    def predict(self, x, return_sample = True):
+        x = x.unsqueeze(0) if x.dim() == 2 else x
+
+        maze_hist = torch.stack(
+            [self.clf(x[i]).unsqueeze(1) for i in range(x.size(0))], dim = 0)
+        x = torch.cat([x, maze_hist], dim = -1)
+        
+        if return_sample:
+            samples = self.transition.predict(x)
+            return samples
+
+
+class StateProcess1(nn.Module):
+
+    def __init__(
+            self, 
+            quality_classifier, 
+            transition_model, 
+            #history_length, mode = 1,
+        ):
+
+        super(StateProcess1, self).__init__()
+
+        self.clf = quality_classifier
+        self.transition = transition_model
+        #self.history_length = history_length
+        #self.mode = mode
+
+    def predict(self, x, return_sample = True):
+        x = x.unsqueeze(0) if x.dim() == 2 else x
+
+        quality_hist = torch.stack(
+            [self.clf(x[i].to('cpu')).unsqueeze(1) for i in range(x.size(0))], 
+            dim = 0).to(x.device)
+        x = torch.cat([x, quality_hist], dim = -1)
+        
+        if return_sample:
+            delta = self.transition.predict(x)
+            return x[:,-1,:-1] + delta
+        
+        else:
+            delta_mu, sigma = self.transition.predict(x, return_sample = False)
+            return x[:,-1,:-1] + delta_mu, sigma
+
 
 # this needs to be updated; will not work with current models
 def evaluate_history(sun_maze, max_history_length, 
@@ -115,127 +193,190 @@ def evaluate_history(sun_maze, max_history_length,
 
 if __name__ == '__main__':
     
-    # history length
-    hl = 32
+    hp = {}
+    hp['rat name'] = 'Bon'
+    hp['input HL'], hp['label HL'] = 0, 0
+    hp['include vel'], hp['dirvel'] = False, False
+    hp['dmin'], hp['dmax'] = 0.5, 20
+    hp['resolution'], hp['threshold'] = 0.1, 100
+    hp['presence'], hp['p_range'] = False, 2
+
     
-    # data transform
-    tf = RangeNormalize()
+    data = generate_dataset(
+        rat_name = hp['rat name'], 
+        input_history_length = hp['input HL'], spike_bin_size = 1, 
+        label_history_length = hp['label HL'], include_velocity = hp['include vel'], 
+        dirvel = hp['dirvel'], dmin = hp['dmin'], dmax = hp['dmax'],
+        grid_resolution = hp['resolution'], balance_resolution = hp['resolution'], 
+        threshold = hp['threshold'], presence = hp['presence'], p_range = hp['p_range'],
+        )
+
+    in_train_input, in_train_label = data['train_positions'].float(), data['train_labels'].float()
+    valid_input, valid_label = data['valid_positions'].float(), data['valid_labels'].float()
+    test_input, test_label = data['test_positions'].float(), data['test_labels'].float()
+    
+    maze_grid = data['maze_grid']
+    xmin, xmax, ymin, ymax = data['xmin'], data['xmax'], data['ymin'], data['ymax']
+    
+
+    tf = RangeNormalize(dim = 2, norm_mode = [0,0,])
     tf.fit(
-        pos_mins = torch.Tensor([-50, -50]), pos_maxs = torch.Tensor([150, 150])
+        range_min = (xmin, ymin,), range_max = (xmax, ymax,),
         )
     
     insideMaze = GridClassifier(
-        grid = torch.load('InMaze/maze_grid_classifier_[-50,150]_res2.pt'), 
-        xmin = -50, ymin = -50, resolution = 2, transform = tf)
-    
-    # load in-maze data and generate in-maze probability history
-    raw_in_data = torch.load(f'Datasets/in_data_HL{hl}.pt')
-    
-    in_data = torch.cat([
-        tf.transform(raw_in_data),
-        torch.ones((raw_in_data.size(0), hl, 1)),
-        ], dim = -1)
-    
-    # split in-maze data into inputs and labels
-    in_input, in_label = in_data[:-1,:,:], in_data[1:,-1,:-1]
-    
-    # load out-maze data and generate in-maze probability history
-    raw_out_data = generate_trajectory_history(
-        data = torch.load('InMaze/out_trajectory.pt'), history_length = hl)
-    out_data = generate_inside_maze_prob_history(
-        data = tf.transform(raw_out_data), inside_maze_model = insideMaze)
-    print(out_data[:,:,-1].sum().sum(), out_data.size(0)*out_data.size(1))
-    
-    # split out-maze data into inputs and labels
-    out_input, out_label = out_data[:-1,:,:], out_data[1:,-1,:-1]
-    
-    # for balanced data between in-maze and out-maze data, randomly sample 
-    #   points from out-maze data
-    out_idxs = torch.randperm(out_input.size(0))[:in_input.size(0)]
-    out_input, out_label = out_input[out_idxs], out_label[out_idxs]
-        
-    # set bounds used for creating train / validation / test datasets
-    b0 = int(0.85*in_input.size(0))
-    b1 = int(0.95*in_input.size(0))
-    
-    
-    # aggregate in-maze and out-maze data into train / validation / test datasets
-    
-    train_input = torch.cat(
-        [in_input[:b0], out_input[:b0]], dim = 0).flatten(1,-1)
-    valid_input = torch.cat(
-        [in_input[b0:b1], out_input[b0:b1]], dim = 0).flatten(1,-1)
-    # interested in test performance on in-maze data
-    test_input = in_input[b1:].flatten(1,-1)
-    
-    train_label = torch.cat(
-        [in_label[:b0], out_label[:b0]], dim = 0)
-    valid_label = torch.cat(
-        [in_label[b0:b1], out_label[b0:b1]], dim = 0)
-    # interested in test performance on in-maze data
-    test_label = in_label[b1:]
+        grid = maze_grid, 
+        xmin = xmin, ymin = ymin, resolution = hp['resolution'], 
+        transform = tf,
+    )
 
-    # train labels for modelA and modelB
-    tr_labelA = train_label[:,0]
-    tr_labelB = train_label[:,1]
+
+    normal = Normal(torch.zeros((1,)).squeeze(), torch.ones((1,)).squeeze() * 0.1)
+
+    iti = [in_train_input]
+    itl = [in_train_label]
+    vi = [valid_input]
+    vl = [valid_label]
+
+    print('\nupsampling in-maze data.....')
+    for _ in range(150000 // in_train_input.size(0)):
+        iti.append(in_train_input + normal.sample(in_train_input.size()))
+        itl.append(in_train_label + normal.sample(in_train_label.size()))
+        vi.append(valid_input + normal.sample(valid_input.size()))
+        vl.append(valid_label + normal.sample(valid_label.size()))
     
-    # validation labels for modelA and modelB
-    va_labelA = valid_label[:,0]
-    va_labelB = valid_label[:,1]
+    iti = torch.cat(iti, dim = 0)
+    vi = torch.cat(vi, dim = 0)
+
+
+    in_train_input = torch.cat([
+        iti, torch.ones((iti.size(0), iti.size(1), 1)),
+    ], dim = -1)
+    in_train_label = torch.cat(itl, dim = 0)
+
+    valid_input = torch.cat([
+        vi, torch.ones((vi.size(0), vi.size(1), 1)),
+    ], dim = -1)
+    valid_label = torch.cat(vl, dim = 0)
+
+    test_input = torch.cat([
+        test_input, torch.ones((test_input.size(0), test_input.size(1), 1)),
+    ], dim = -1)
+
+
+    print('\ngathering random walk data.....')
+    out_data = generate_trajectory_history(
+        data = torch.load(f'Datasets/random walk/{hp["rat name"]}.pt'), 
+        history_length = hp['input HL'],
+    )
+    out_data = out_data[torch.randperm(out_data.size(0))[:in_train_input.size(0)]]
+
+    out_train_input, out_train_label = out_data[:-1,:,:], out_data[1:,-1,:]
+
+    out_train_input = generate_inside_maze_prob_history(
+        data = out_train_input, inside_maze_model = insideMaze,
+    )
+
+
+    print('\nnormalizing inputs & labels.....')
+    #train_input = torch.cat([in_train_input, out_train_input], dim = 0)
+    train_input = in_train_input
+    train_input[:,:,:-1] = tf.transform(train_input[:,:,:-1])
+    #train_label = tf.transform(torch.cat([in_train_label, out_train_label], dim = 0)) - train_input[:,-1,:-1]
+    train_label = tf.transform(in_train_label) - train_input[:,-1,:-1]
+
+    valid_input[:,:,:-1] = tf.transform(valid_input[:,:,:-1])
+    valid_label = tf.transform(valid_label) - valid_input[:,-1,:-1]
+
+    test_input = tf.transform(test_input[:,:,:-1])
+
+    print('\n', train_input.size(), valid_input.size(), test_input.size())
     
-    # unnormalize test labels
-    te_label = tf.untransform(test_label)
+
+    hp['hidden layer sizes'] = [16,16]
+
+    """ model_name = 'GaussianBayesMLP-param_dist-gaussian'
+    JointProbXY = GaussianBayesMLP(
+        hidden_layer_sizes = hp['hidden layer sizes'], 
+        input_dim = train_input.size(1)*train_input.size(2),
+        latent_dim = 4 if hp['include vel'] else 2, 
+        parameter_distribution = 'gaussian',
+    ) """
+
+    model_name = 'GaussianMLP'
+    transition_model = GaussianMLP(
+        hidden_layer_sizes = hp['hidden layer sizes'],
+        input_dim = train_input.size(1)*train_input.size(2),
+        latent_dim = 4 if hp['include vel'] else 2,
+    )
+
+    """ model_name = 'GaussianLTC'
+    JointProbXY = GaussianLTC(
+        hidden_layer_size = 4, num_layers = 1,
+        sequence_dim = train_input.size(1), feature_dim = train_input.size(2), 
+        latent_dim = 4 if hp['include vel'] else 2,
+        last_hidden_state = False, use_cell_memory = False, solver_unfolds = 6,
+    ) """
     
-    # initialize modelA
-    P_x_given_input = PositionNN(hidden_layer_sizes = [32,32], input_dim = hl*3)
-    #P_x_given_input.load_state_dict(torch.load(f'Models/P_x_y_HL{hl}/2layerMLP_P_x_given_input_hid32.pt'))
     
-    # initialize modelB
-    P_y_given_x_input = PositionNN(hidden_layer_sizes = [32,32], input_dim = hl*3+2)
-    #P_y_given_x_input.load_state_dict(torch.load(f'Models/P_x_y_HL{hl}/2layerMLP_P_y_given_x_input_hid32.pt'))
-    
-    # initialize trainers for modelA and modelB
-    trainerA = TrainerGaussNLL(
-        optimizer = torch.optim.SGD(P_x_given_input.parameters(), lr = 1e-3))
-    trainerB = TrainerGaussNLL(
-        optimizer = torch.optim.SGD(P_y_given_x_input.parameters(), lr = 1e-3))
-    
-    # run training scheme
-    TwoModelTrain(
-        modelA = P_x_given_input, modelB = P_y_given_x_input, 
-        trainerA = trainerA, trainerB = trainerB, 
-        train_input = train_input, valid_input = valid_input, 
-        train_labelA = tr_labelA, valid_labelA = va_labelA, 
-        train_labelB = tr_labelB, valid_labelB = va_labelB,
-        epochs = (300,400), batch_size = 256, plot_losses = True,
+    root = None
+    root = 'StateModels/trained/GaussianMLP_2023-11-3_23-15-58'
+
+    hp['lr'] = 1e-3
+
+    if root == None:
+
+        trainer = TrainerMLE(
+            optimizer = torch.optim.SGD(transition_model.parameters(), lr = hp['lr']),
         )
-    
-    # save models
-    torch.save(P_x_given_input.state_dict(), f'Models/P_x_y_HL{hl}/2layerMLP_P_x_given_input_hid32.pt')
-    torch.save(P_y_given_x_input.state_dict(), f'Models/P_x_y_HL{hl}/2layerMLP_P_y_given_x_input_hid32.pt')
-    
-    # load modelA and modelB into two-model wrapper class
-    JointProbXY = TwoModelWrapper(
-        modelA = P_x_given_input, modelB = P_y_given_x_input, transform = tf,
+        _, _, _, fig = trainer.train(
+            model = transition_model,
+            train_data = Data(train_input, train_label),
+            valid_data = Data(valid_input, valid_label),
+            epochs = 1000, batch_size = 512, plot_losses = True,
         )
+
+        now = datetime.datetime.now()
+        root = f'StateModels/trained/{model_name}_'
+        root += f'{now.year}-{now.month}-{now.day}_{now.hour}-{now.minute}-{now.second}'
+        os.mkdir(root)
+
+        torch.save(transition_model.state_dict(), root+'/state_dict.pt')
+
+        fig.savefig(root+'/loss_curves.jpeg')
+        plt.close(fig)
+
+        state_process = StateProcess1(
+            transition_model = transition_model,
+            quality_classifier = insideMaze,
+            )
     
+    else:
+        transition_model.load_state_dict(torch.load(root+'/state_dict.pt'))
+        state_process = StateProcess1(
+            transition_model = transition_model,
+            quality_classifier = insideMaze,
+            )
+    
+    state_process.to('cpu')
+
     # evaluate performance (MSE) on test data
-    pred = JointProbXY.predict(
-        test_input, return_sample = True, untransform_data = True,)
+    pred = tf.untransform(state_process.predict(test_input, return_sample = True))
     
-    pred_MSE = nn.MSELoss()(pred, te_label)
+    pred_MSE = nn.MSELoss()(pred, test_label)
     print('\ntest mse: %.3f' % pred_MSE)
     
     # plot performance on test data
-    pred_mean, pred_vars = JointProbXY.predict(
-        test_input, return_sample = False, untransform_data = True,)
+    pred_mean, pred_sdev = state_process.predict(test_input, return_sample = False)
+    pred_mean, pred_vars = tf.untransform(pred_mean, pred_sdev**2)
     
-    plot_model_predictions(
-        pred_mean, pred_vars, te_label, 
-        title = f'P(X,Y|input) = P(Y|X,input) * P(X|input) | HL = {hl}\nTest Predictions (MSE: %.3f)' % pred_MSE,
-        )
+    fig = plot_model_predictions(
+        pred_mean, pred_vars, test_label, 
+        title = f'P(X,Y|input) | HL = {hp["input HL"]}\nTest Predictions (MSE: %.3f)' % pred_MSE,
+    )
 
-
+    fig.savefig(root+'/test_predictions.jpeg')
+    plt.close(fig)
 
 
 
