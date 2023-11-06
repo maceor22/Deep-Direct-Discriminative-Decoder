@@ -6,8 +6,7 @@ from torch.nn.utils import clip_grad_value_
 from torch.distributions import MultivariateNormal, Normal
 import time
 from copy import deepcopy
-from maze_utils import RangeNormalize
-from state_process_models import Data
+from maze_utils import RangeNormalize, Data
 import numpy as np
 import matplotlib.pyplot as plt
 
