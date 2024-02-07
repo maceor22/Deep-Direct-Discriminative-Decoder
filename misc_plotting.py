@@ -1,7 +1,9 @@
 import numpy as np
+import os
 import torch
 from copy import deepcopy
 from torch.distributions import Normal, MultivariateNormal
+from distributions import GaussianMixture, MultivariateNormalMixture
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 from maze_utils import Maze, RangeNormalize
@@ -52,7 +54,97 @@ def plot_spikes_on_maze(maze, single_plot = True):
             spike_count = maze.spike_counts[:,ix[i]].sum().long()
             plt.title(f'Spikes over Maze | Neuron {ix[i]+1} | spike_count: {spike_count}')
         
+
+def plot_spikes_versus_regions(region_dict, spikes, positions, save_path):
+    
+    for c in range(spikes.size(1)):
+        print('\ncell', c)
+        ix = spikes[:,c].nonzero().squeeze()
+        spike = spikes[ix,c]
+        pos = positions[ix]
+
+        if ix.dim() == 0:
+            pc = 0
+            sc = 0
+        else:
+            pc = ix.size(0)
+            sc = spike.sum(0).long().item()
+
+        fig, ax = plt.subplots(ncols = 2, figsize = (16,8))
+        fig.suptitle(f'Spike Activity vs Region | Neuron {c} | total points: {pc} | total spikes: {sc}')
+
+        ax[0].plot(
+            pos[:,0], pos[:,1], 'o', color = '0.4', ms = 1, 
+            label = 'spike locations')
+        ax[0].set_xlabel('X-axis', fontsize = 16)
+        ax[0].set_ylabel('Y-axis', fontsize = 16)
+        ax[0].legend(fontsize = 12, loc = 'lower left')
+
+        point_count = []
+        spike_count = []
+
+        for key, reg in region_dict.items():
+            mask = pos[:,0] > reg['xmin']
+            mask *= pos[:,0] < reg['xmax']
+            mask *= pos[:,1] > reg['ymin']
+            mask *= pos[:,1] < reg['ymax'] 
+            ix = mask.nonzero().squeeze()
+            
+            if ix.dim() == 0:
+                point_count.append(0)
+                spike_count.append(0)
+            else:
+                point_count.append(ix.size(0))
+                spike_count.append(spike[ix].sum(0).item())
+
+            ax[0].plot(
+                torch.tensor([reg['xmin'], reg['xmax']]),
+                torch.tensor([reg['ymin'], reg['ymin']]), 
+                'k', lw = 2)
+            ax[0].plot(
+                torch.tensor([reg['xmin'], reg['xmin']]),
+                torch.tensor([reg['ymin'], reg['ymax']]), 
+                'k', lw = 2)
+            ax[0].plot(
+                torch.tensor([reg['xmin'], reg['xmax']]),
+                torch.tensor([reg['ymax'], reg['ymax']]), 
+                'k', lw = 2)
+            ax[0].plot(
+                torch.tensor([reg['xmax'], reg['xmax']]),
+                torch.tensor([reg['ymin'], reg['ymax']]), 
+                'k', lw = 2)
+            ax[0].text(
+                reg['xmin']+4, reg['ymin']+4, str(key), 
+                fontsize = 12, fontweight = 'bold', color = 'red')
         
+        barWidth = 0.2
+        bar1 = [_ for _ in range(len(region_dict))]
+        bar2 = [_ + barWidth for _ in bar1]
+
+        ax[1].bar(bar1, point_count, color = 'orange', width = barWidth,
+                  edgecolor = 'grey', label = 'point count')
+        ax[1].bar(bar2, spike_count, color = 'blue', width = barWidth,
+                  edgecolor = 'grey', label = 'spike count')
+        ax[1].legend(fontsize = 12)
+        
+        ax[1].set_xlabel('Region', fontsize = 16)
+        ax[1].set_xticks([_ + 0.5*barWidth for _ in range(len(region_dict))])
+        ax[1].set_xticklabels([key for key in region_dict.keys()])
+
+        ax[1].set_ylabel('Counts', fontsize = 16)
+
+        if not os.path.exists(save_path):
+            os.mkdir(save_path)
+
+        fig.savefig(save_path+f'/neuron{c}.jpeg')
+        plt.close(fig)
+
+    plt.show()
+        
+
+
+    return
+
         
 def plot_spike_probs(clf, data, labels):
     norm = RangeNormalize()
@@ -141,70 +233,6 @@ def plot_density_mixture_pi_heatmap(mixture_model, input_data):
     ax.set_ylabel('Mixture Probability')
     fig.suptitle('Mixture Probability vs Time')
     
-    
-def plot_density_mixture_likelihood(
-        mixture_model, input_data, label_data, posNorm, log_likelihood = False,
-        ):
-    device = 'cpu'
-
-    latent = torch.linspace(0,1,100)
-    
-    X_likelihood = torch.zeros((input_data.size(0), 100))
-    Y_likelihood = torch.zeros((input_data.size(0), 100))
-    
-    pi_k, mu_k, var_k = mixture_model(input_data)
-    
-    for i in range(input_data.size(0)):
-        xtemp = torch.zeros_like(latent)
-        ytemp = torch.zeros_like(latent)
-        for k in range(mixture_model.num_mixtures):
-            xtemp += torch.exp(
-                Normal(mu_k[i,k,0], var_k[i,k,0]).log_prob(latent)
-                ) * pi_k[i,k]
-            ytemp += torch.exp(
-                Normal(mu_k[i,k,1], var_k[i,k,1]).log_prob(latent)
-                ) * pi_k[i,k]
-        X_likelihood[i,:] = xtemp
-        Y_likelihood[i,:] = ytemp
-    
-    if log_likelihood:
-        X_likelihood = torch.log(X_likelihood).double()
-        X_likelihood = torch.where(X_likelihood < -7.5, -7.5, X_likelihood)
-        Y_likelihood = torch.log(Y_likelihood).double()
-        Y_likelihood = torch.where(Y_likelihood < -7.5, -7.5, Y_likelihood)
-        pi_k = torch.log(pi_k).double()
-        pi_k = torch.where(pi_k < -7.5, -7.5, pi_k)
-    
-    fig, ax = plt.subplots(nrows = 3, sharex = True)
-    fig.suptitle('Position Log-Likelihood Heatmap vs Time' if log_likelihood else 'Position Likelihood Heatmap vs Time')
-    plt.xlabel('Time [s]')
-    
-    xmin, xmax = posNorm.range_min[0].item(), posNorm.range_max[0].item()
-    ymin, ymax = posNorm.range_min[1].item(), posNorm.range_max[1].item()
-    
-    ax[0].pcolormesh(X_likelihood.T.detach(), cmap = 'viridis')
-    ax[0].set_ylabel('X log-likelihood' if log_likelihood else 'X likelihood', fontsize = 8)
-    xdelta = (xmax-xmin)/6
-    ax[0].set_yticks([100/6,500/6])
-    ax[0].set_yticklabels([int(xmin+xdelta), int(xmax-xdelta)], fontsize = 8)
-    
-    ax[1].pcolormesh(Y_likelihood.T.detach(), cmap = 'viridis')
-    ax[1].set_ylabel('Y log-likelihood' if log_likelihood else 'Y likelihood', fontsize = 8)
-    ydelta = (ymax-ymin)/6
-    ax[1].set_yticks([100/6,500/6])
-    ax[1].set_yticklabels([int(ymin+ydelta), int(ymax-ydelta)], fontsize = 8)
-    
-    ax[2].pcolormesh(pi_k.T.detach(), cmap = 'viridis')
-    ax[2].set_ylabel('Mixture\nlog-likelihood' if log_likelihood else 'Mixture\nlikelihood', fontsize = 8)
-    yticks = torch.arange(0.5, mixture_model.num_mixtures, 2)
-    ax[2].set_yticks(yticks)
-    ax[2].set_yticklabels([i.item() for i in (yticks+0.5).long()], fontsize = 8)
-    
-    xticks = torch.arange(0, label_data.size(0), int(20*30))
-    ax[2].set_xticks(xticks)
-    ax[2].set_xticklabels([(i/30).int().item() for i in xticks])
-
-
 
 #@profile
 def probabilistic_model_likelihood(
@@ -225,7 +253,7 @@ def probabilistic_model_likelihood(
     xmin, xmax = posNorm.range_min[0].item(), posNorm.range_max[0].item()
     ymin, ymax = posNorm.range_min[1].item(), posNorm.range_max[1].item()
     
-    res = 120 / (grid_dim - 1)
+    res = (xmax - xmin) / (grid_dim - 1)
     ind = data_to_index(
         posNorm.untransform(label_data.to(device)) if untransform_label else label_data.to(device), 
         xmin, ymin, resolution = res, unique = False,
@@ -235,15 +263,11 @@ def probabilistic_model_likelihood(
     buffer = int(grid_dim/100)
     
     total_likelihood = 0
-
-    tracemalloc.start()
     
     for i in range(input_data.size(0)):
-        #print(i)
-        p = model.prob(input_data[i].expand(n_points,-1,-1), latent).detach()
+        p = model.log_prob(input_data[i].expand(n_points,-1,-1), latent).exp().detach()
         p_total = p.sum(dim = 0) 
         
-
         log_prob = torch.log(p / p_total).view(grid_dim,grid_dim)
         #print(tracemalloc.get_traced_memory())
 
@@ -292,7 +316,7 @@ def probabilistic_model_likelihood(
         ax[1].set_yticks([grid_dim/6,(5*grid_dim)/6])
         ax[1].set_yticklabels([int(ymin+ydelta), int(ymax-ydelta)], fontsize = 8)
         
-        xticks = torch.arange(0, label_data.size(0), int(20*30))
+        xticks = torch.arange(1, 5, 1) * int(label_data.size(0)/5)
         ax[1].set_xticks(xticks)
         ax[1].set_xticklabels([(i/30).int().item() for i in xticks])
         
@@ -301,6 +325,11 @@ def probabilistic_model_likelihood(
 
         vid_fig, vid_ax = plt.subplots(nrows = 1)
         vid_fig.suptitle(title, fontsize = 10)
+        ticks = np.arange(1,5,1)*int(grid_dim/5)
+        vid_ax.set_xticks(ticks)
+        vid_ax.set_xticklabels((ticks*res+xmin).astype('int'))
+        vid_ax.set_yticks(ticks)
+        vid_ax.set_yticklabels((ticks*res+ymin).astype('int'))
         plt.xlabel('X-axis')
         plt.ylabel('Y-axis')
 
@@ -328,77 +357,46 @@ def probabilistic_model_likelihood(
         return mean_likelihood
 
 
-
-def density_mixture_HPD(
-        mixture_model, covariance_type, input_data, label_data, posNorm, 
-        grid_dim = 100, untransform_label = False, alpha = 0.1, 
+def probabilistic_model_HPD(
+        model, model_name, input_data, label_data, posNorm, 
+        alpha = 0.1, grid_dim = 100, untransform_label = False, 
         plotting = False, video = False,
     ):
     device = 'cpu'
 
-    mixture_model = mixture_model.to(device)
+    model = model.to(device)
+    input_data = input_data.to(device)
 
     latent = torch.linspace(0,1,grid_dim)
     latent = torch.cartesian_prod(latent, latent)
     
     HPD = []
     
-    if covariance_type == 'diag':
-        pi_k, mu_k, sigma_k = mixture_model(input_data.to(device))
-    elif covariance_type == 'full':
-        pi_k, mu_k, tril_k = mixture_model(input_data.to(device))
-    
     xmin, xmax = posNorm.range_min[0].item(), posNorm.range_max[0].item()
     ymin, ymax = posNorm.range_min[1].item(), posNorm.range_max[1].item()
     
-    res = 120 / (grid_dim - 1)
+    res = (xmax - xmin) / (grid_dim - 1)
     ind = data_to_index(
         posNorm.untransform(label_data.to(device)) if untransform_label else label_data.to(device), 
         xmin, ymin, resolution = res, unique = False,
     )
 
+    xmin, ymin = posNorm.range_min[0], posNorm.range_min[1]
+    xmax, ymax = posNorm.range_max[0], posNorm.range_max[1]
+
     n_points = grid_dim**2
     buffer = int(grid_dim/100)
     
-    accuracy = 0
     area_ratio = 0
+    accuracy = 0
 
-    if covariance_type == 'diag':
-        X = latent[:,0].expand(input_data.size(0), -1)
-        Y = latent[:,1].expand(input_data.size(0), -1)
-
-        xprob = torch.zeros_like(X)
-        yprob = torch.zeros_like(Y)
-
-        for k in range(mixture_model.num_mixtures):
-            xprob += torch.exp(Normal(
-                mu_k[:,k,0].expand(n_points,-1).T,
-                sigma_k[:,k,0].expand(n_points,-1).T
-            ).log_prob(X)) * pi_k[:,k].expand(n_points,-1).T
-            yprob += torch.exp(Normal(
-                mu_k[:,k,1].expand(n_points,-1).T,
-                sigma_k[:,k,1].expand(n_points,-1).T
-            ).log_prob(Y)) * pi_k[:,k].expand(n_points,-1).T
-        
-        prob = xprob * yprob
-
-    elif covariance_type == 'full':
-        XY = latent.expand(input_data.size(0), -1, 2)
-
-        prob = torch.zeros((input_data.size(0), n_points))
-
-        for k in range(mixture_model.num_mixtures):
-            prob += torch.exp(MultivariateNormal(
-                loc = mu_k[:,k,:].expand(n_points, -1, 2).transpose(0,1),
-                scale_tril = tril_k[:,k,:,:].expand(n_points,-1,2,2).transpose(0,1),
-            ).log_prob(XY)) * pi_k[:,k].expand(n_points,-1).T
+    #tracemalloc.start()
     
-
     for i in range(input_data.size(0)):
-        print(i)
-        prob[i,:] /= prob[i,:].sum(0)
-
-        sorted, ix = prob[i,:].sort(dim = 0, descending = True)
+        p = model.log_prob(input_data[i].expand(n_points,-1,-1), latent).exp().detach()
+        p /= p.sum(dim = 0)
+        
+        sorted, ix = p.sort(dim = 0, descending = True)
 
         idx = 0
         while sorted[:idx].sum(0) < (1 - alpha):
@@ -417,13 +415,16 @@ def density_mixture_HPD(
         hpd[xind-buffer:xind+buffer+1,yind-buffer:yind+buffer+1] = 0
 
         HPD.append(hpd)
+
+        del p, xind, yind
+        #print(tracemalloc.get_traced_memory())
     
     HPD = torch.stack(HPD, dim = 0)
     
-    accuracy /= input_data.size(0)
     area_ratio /= (input_data.size(0) * n_points)
+    accuracy /= input_data.size(0)
     
-    title = f'{int((1-alpha)*100)}'+'%'+' Highest Posterior Density Region (HDR) vs Time'
+    title = f'{model_name} {int((1-alpha)*100)}% Highest Posterior Density Region (HDR) vs Time'
     title += '\nratio samples in HDR: %.4f' % accuracy
     title += ' | mean HDR area coverage ratio: %.4f' % area_ratio
 
@@ -456,7 +457,7 @@ def density_mixture_HPD(
         ax[1].set_yticks([grid_dim/6,(5*grid_dim)/6])
         ax[1].set_yticklabels([int(ymin+ydelta), int(ymax-ydelta)], fontsize = 8)
         
-        xticks = torch.arange(0, label_data.size(0), int(20*30))
+        xticks = torch.arange(1, 5, 1) * int(input_data.size(0)/5)
         ax[1].set_xticks(xticks)
         ax[1].set_xticklabels([(i/30).int().item() for i in xticks])
         
@@ -465,6 +466,11 @@ def density_mixture_HPD(
 
         vid_fig, vid_ax = plt.subplots(nrows = 1)
         vid_fig.suptitle(title, fontsize = 10)
+        ticks = np.arange(1,5,1)*int(grid_dim/5)
+        vid_ax.set_xticks(ticks)
+        vid_ax.set_xticklabels((ticks*res+xmin.item()).astype('int'))
+        vid_ax.set_yticks(ticks)
+        vid_ax.set_yticklabels((ticks*res+ymin.item()).astype('int'))
         plt.xlabel('X-axis')
         plt.ylabel('Y-axis')
 
@@ -490,7 +496,8 @@ def density_mixture_HPD(
         return vid, accuracy, area_ratio
     else:
         return accuracy, area_ratio
-    
+
+
 
 def plot_density_mixture_metrics(root):
     history_lengths = torch.load(root+'/metrics/history_lengths.pt').numpy()
@@ -680,65 +687,112 @@ def plot_density_mixture_metrics(root):
     return
 
 
-def plot_pretrained_learned_mixtures(maze, mixture_model, input_data, posNorm):
+def raster_plot(spikes, pos):
+    fig, ax = plt.subplots(
+        nrows = 3, sharex = True,
+        gridspec_kw = {'height_ratios' : [2,1,1]})
+
+    fig.suptitle('Raster Plot')
+
+    #ax.imshow(spikes, aspect = 'auto', interpolation = 'none', origin = 'lower')
+    ax[0].pcolormesh(spikes, cmap = 'Greys')
+    ax[0].set_ylabel('Place Cells')
+
+    ax[1].plot(range(pos.size(0)), pos[:,0], 'k')
+    ax[1].set_ylabel('X Position')
+
+    ax[2].plot(range(pos.size(0)), pos[:,1], 'k')
+    ax[2].set_ylabel('Y Position')
+
+    xticks = ax[2].get_xticks()
+    ax[2].set_xticks(xticks)
+    ax[2].set_xticklabels((xticks/30).astype('int'))
+    ax[2].set_xlabel('Time [s]')
+
+    return fig
+
+
+def plot_maze(maze_data):
+    fig, ax = plt.subplots()
+
+    fig.suptitle('Maze Structure Top View')
+    ax.set_xlabel('X axis')
+    ax.set_ylabel('Y axis')
+    ax.plot(maze_data[:,0], maze_data[:,1], 'o', color = '0.4', ms = 2)
+
+    return fig
+
+
+def plot_pretrained_learned_mixtures(mixture_model, input_data, label_data, posNorm):
+    mixture_model.to(input_data.device)
+    distribution = mixture_model(input_data)
+
+    sample = distribution.component_distribution.base_dist.sample()
     
-    pik, muk, vark = mixture_model(input_data)
+    sample = posNorm.untransform(sample)
+    label_data = posNorm.untransform(label_data)
     
-    samp = posNorm.untransform(
-        Normal(muk.mean(0), vark.mean(0)**0.5).sample((50,))
-        )
-    
-    plt.figure()
-    plt.plot(maze.pos[:,0], maze.pos[:,1], 'o', color = '0.4', label = 'maze', markersize = 0.5)
+    fig, ax = plt.subplots()
+    ax.plot(label_data[:,0], label_data[:,1], 'o', color = '0.4', label = 'maze', markersize = 0.5)
     for k in range(mixture_model.num_mixtures):
-        plt.plot(samp[:,k,0], samp[:,k,1], 'o', label = f'mixture {k+1}', markersize = 2)
-    plt.legend(fontsize = 8)
-    plt.xlabel('X-axis')
-    plt.ylabel('Y-axis')
-    plt.title('Learned Mixtures from Pre-trained Model')
+        ax.plot(sample[:,k,0], sample[:,k,1], 'o', label = f'mixture {k+1}', markersize = 2)
+    ax.legend(fontsize = 8)
+    ax.set_xlabel('X-axis')
+    ax.set_ylabel('Y-axis')
+    fig.suptitle('Learned Mixtures from Pre-trained Model')
+
+    return fig
     
 
 
-def plot_filter_performance(D4, latent_labels, transform):
+def plot_filter_performance(D4, latent_labels, transform, rmse):
+    PARTICLES = []
+    for i in range(latent_labels.size(0)):
+        PARTICLES.append(D4.u_particles[i])
+        PARTICLES.append(D4.w_particles[i])
+
     fig, ax = plt.subplots(nrows = 1)
     ax.set_xlabel('X-axis')
     ax.set_ylabel('Y-axis')
-    ax.set_xlim(150,270)
-    ax.set_ylim(50,170)
+    xmin, ymin = transform.range_min[0], transform.range_min[1]
+    xmax, ymax = transform.range_max[0], transform.range_max[1]
+    ax.set_xlim(xmin,xmax)
+    ax.set_ylim(ymin,ymax)
 
-    fig.suptitle(f'D4 Filter Performance\nnumber of particles: {D4.n_particles}')
+    fig.suptitle(f'D4 Filter Performance | RMSE: %.3f\nnumber of particles: {D4.n_particles}' % rmse)
     
     ax.plot(latent_labels[:,0], latent_labels[:,1], 'o', color = '0.4', markersize = 0.5)
 
-    particle_traces = [
+    """ particle_traces = [
         ax.plot([], [], color = 'cyan', linewidth = 1)[0] for _ in range(D4.n_particles)
-        ]
+        ] """
 
     particles, = ax.plot([], [], 'o', color = 'blue', markersize = 5)
 
-    latent_trace, = ax.plot([], [], color = 'k', linewidth = 3)
+    """ latent_trace, = ax.plot([], [], color = 'k', linewidth = 3) """
     latent_point, = ax.plot([], [], 'o', color = 'k', markersize = 15)
 
     time_text = ax.text(
-        latent_labels.min(0)[0][0]+2, latent_labels.max(0)[0][1]-2, '', fontsize = 10)
+        xmin+5, ymax-15, '', fontsize = 10)
 
     def animator(i):
         t = int(i/2)
 
-        trace_data = transform.untransform(D4.traces[i].detach())
-        particle_data = transform.untransform(D4.particles[i].detach())
+        """ trace_data = transform.untransform(D4.traces[i].detach()) """
+        particle_data = transform.untransform(PARTICLES[i].detach())
 
-        for n in range(D4.n_particles):
-            particle_traces[n].set_data(trace_data[n,:,0], trace_data[n,:,1])
+        """ for n in range(D4.n_particles): """
+        """     particle_traces[n].set_data(trace_data[n,:,0], trace_data[n,:,1]) """
         
         particles.set_data(particle_data[:,0], particle_data[:,1])
         
-        latent_trace.set_data(latent_labels[:t+1,0], latent_labels[:t+1,1])
+        """ latent_trace.set_data(latent_labels[:t+1,0], latent_labels[:t+1,1]) """
         latent_point.set_data(latent_labels[t,0], latent_labels[t,1])
 
         time_text.set_text('time = %.3f' % (t*0.033))
         
-        return [*particle_traces, particles, latent_trace, latent_point, time_text]
+        """ return [*particle_traces, particles, latent_trace, latent_point, time_text] """
+        return [particles, latent_point, time_text]
 
     vid = animation.FuncAnimation(
         fig, animator, 2*latent_labels.size(0), interval = 25, blit = True, repeat_delay = 500,
