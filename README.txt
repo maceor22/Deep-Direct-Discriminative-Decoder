@@ -3,12 +3,13 @@
 # Need to upload rest of data (large files)
 
 # Interesting to check out:
-  # 
+  # Facilitation-Depression Recurrent Algorithm.pdf - writeup proposal for facilitation-depression recurrent neural network
   # fd.py - implementation of facilitation-depression recurrent neural network
   # CosyneAbstractSubmission.pdf - short summary of work and results as of 11/19/2023
-  # observation_process.py - creation and training of D4 observation process
-  # state_process.py - creation and training of D4 state process
-  # D4.py - implementation of D4 using particle filtering / smoothing
+  # DirectDiscriminativeDecoder_EMBC.pdf - short summary of work and results as of 2/2/2024
+  # prediction_process.py - creation and training of DDD prediction process
+  # state_process.py - creation and training of DDD state process
+  # D4.py - implementation of DDD using particle filtering / smoothing
   # models.py - definitions for probabilistic models
   # trainers.py - definition of training scheme using maximum likelihood estimation
   # bayesian.py - implementation of Bayesian Linear layer (parameters of linear layer are treated as distributions)
