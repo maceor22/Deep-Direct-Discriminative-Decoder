@@ -3,6 +3,8 @@
 # Need to upload rest of data (large files)
 
 # Interesting to check out:
+  # 
+  # fd.py - implementation of facilitation-depression recurrent neural network
   # CosyneAbstractSubmission.pdf - short summary of work and results as of 11/19/2023
   # observation_process.py - creation and training of D4 observation process
   # state_process.py - creation and training of D4 state process
