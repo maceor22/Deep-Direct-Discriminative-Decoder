@@ -1,7 +1,6 @@
 from maze_utils import Maze
 from in_maze_model import InMazeModelNN, GridClassifier
 from data_generation import generate_trajectory_history, data_to_index, index_to_data
-from state_process_models import *
 import matplotlib.pyplot as plt
 import torch
 from torch import nn as nn
@@ -240,28 +239,6 @@ if __name__ == '__main__':
             # break from while loop
             done = True
     print('  sample found.....\n')
-    
-    
-# =============================================================================
-#     probs = insideMaze(dat[:,-1,:])
-#     print(dat.size(), probs.sum())    
-#     
-#     grid = insideMaze.grid
-#     
-#     in_maze = []
-#     for i in range(grid.size(0)):
-#         for j in range(grid.size(1)):
-#             if grid[i,j] == 1:
-#                 in_maze.append(torch.tensor([i,j]).unsqueeze(0))
-#     in_maze = torch.cat(in_maze, dim = 0)
-#     in_maze = index_to_data(in_maze, -50, -50, 2)
-#     
-#     plt.figure()
-#     plt.plot(in_maze[:,0], in_maze[:,1], 'o', color = 'k', markersize = 5)
-#     plt.plot(Wmaze[:,0], Wmaze[:,1], 'o', color = '0.4', markersize = 0.5)
-# =============================================================================
-    
-    
     
     
     # run trajectory simulation

@@ -4,40 +4,43 @@ import matplotlib.pyplot as plt
 import torch
 from torch import nn as nn
 from torch import autograd as ag
-from torch.distributions.normal import Normal
-from torch.distributions.multivariate_normal import MultivariateNormal
-from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
-from torch.nn.utils import clip_grad_norm_, clip_grad_value_
+from torch.nn.utils import clip_grad_value_
+import torch.multiprocessing as mp
+from torch.utils.data.distributed import DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed import init_process_group, destroy_process_group
 import numpy as np
 import time as time
-            
+import os
+import json
 
-# class for training model using negative log-likelihood
-class TrainerNLL(object):
+
+
+class TrainerMLE(object):
     
-    def __init__(self, optimizer, suppress_prints = False):
-        # optimizer: optimizer object to be used during training
+    def __init__(self, optimizer, suppress_prints = False, print_every = 10):
+        # optimizer: optimizer object used during training
         self.optimizer = optimizer
         self.suppress = suppress_prints
+        self.print_every = print_every
     
     # method for training
-    def train(self, model, train_data, valid_data,
-              epochs = 100, batch_size = 64, plot_losses = False):
+    def train(self, model, train_data, valid_data, grad_clip_value = 5,
+              epochs = 100, batch_size = 64, shuffle = True, 
+              plot_losses = False, save_path = None,
+              ):
         # model: initialized model to be trained
         # train_data: Data object containing training data
         # valid_data: Data object containing validation data
-        # epochs: number of epochs to run during training
-        # batch_size: size of batches to be used during training
-        # plot_losses: boolean indicating whether to produce loss plots
         
         # send model to device
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
         model = model.to(device)
         
-        # create dataloader objects for training and validation
-        train_dataloader = DataLoader(train_data, batch_size = batch_size, shuffle = True)
-        valid_dataloader = DataLoader(valid_data, batch_size = batch_size, shuffle = True)
+        # create dataloader objects for training data and validation data
+        train_dataloader = DataLoader(train_data, batch_size = batch_size, shuffle = shuffle)
+        valid_dataloader = DataLoader(valid_data, batch_size = batch_size, shuffle = shuffle)
         
         train_losses = []
         valid_losses = []
@@ -45,10 +48,8 @@ class TrainerNLL(object):
         stime = time.time()
         
         best_loss = 1e10
+        best_state_dict = deepcopy(model.state_dict())
         
-        # begin training scheme
-        if not self.suppress:
-            print('\ntraining.....\n')
         for epoch in range(1,epochs+1):        
             train_loss = 0
             valid_loss = 0
@@ -56,24 +57,30 @@ class TrainerNLL(object):
             model.train()
             # iterate over the training data
             for input_batch, label_batch in train_dataloader:
-                input_batch = ag.Variable(input_batch.to(device))
-                label_batch = ag.Variable(label_batch.to(device))
+                try:
+                    input_batch = ag.Variable(input_batch.to(device))
+                    label_batch = ag.Variable(label_batch.to(device))
+                    
+                    # minimize negative log likelihood
+                    nll = -1 * model.log_prob(input_batch, label_batch).mean(dim = 0)
+                    
+                    # zero gradients
+                    self.optimizer.zero_grad()
+                    # backpropagate loss
+                    nll.backward()
+                    # prevent exploding gradients
+                    clip_grad_value_(model.parameters(), clip_value = grad_clip_value)
+                    # update weights
+                    self.optimizer.step()
+                    # aggregate training loss
+                    train_loss += nll.item()
                 
-                # obtain log-probability values
-                log_prob = model(input_batch)
-                # compute loss
-                loss = 2*nn.NLLLoss()(log_prob, label_batch)
-                
-                # zero gradients
-                self.optimizer.zero_grad()
-                # backpropagate loss
-                loss.backward()
-                # prevent exploding gradients
-                clip_grad_norm_(model.parameters(), max_norm = 2.0)
-                # update weights
-                self.optimizer.step()
-                # aggregate training loss
-                train_loss += loss.item()
+                except:
+                    # if NaNs encountered in gradients
+                    print('exception occurred during parameter update step')
+                    model.load_state_dict(best_state_dict)
+                    train_loss += 10
+
             
             # compute mean training loss and save to list
             train_loss /= len(train_dataloader)
@@ -83,10 +90,17 @@ class TrainerNLL(object):
             with torch.no_grad():
                 # iterate over validation data
                 for input_batch, label_batch in valid_dataloader:
-                    # obtain log-probability values
-                    log_prob = model(input_batch)
-                    # compute and aggregate validation loss
-                    valid_loss += 2*nn.NLLLoss()(log_prob, label_batch).item()
+                    try:
+                        # produce negative log likelihood
+                        nll = -1 * model.log_prob(
+                            input_batch.to(device), label_batch.to(device)).mean(dim = 0)
+                        # compute and aggregate validation loss 
+                        valid_loss += nll.item()
+                    
+                    except:
+                        print('exception occurred during parameter validation step')
+                        model.load_state_dict(best_state_dict)
+                        valid_loss += 10
             
             # compute mean validation loss and save to list
             valid_loss /= len(valid_dataloader)
@@ -97,260 +111,19 @@ class TrainerNLL(object):
                 best_loss = valid_loss
                 best_epoch = epoch
                 best_state_dict = deepcopy(model.state_dict())
-            
-            if not self.suppress:
-                # printing
-                if epoch % 10 == 0:
-                    print(f'------------------{epoch}------------------')
-                    print('training loss: %.2f | validation loss: %.2f' % (
-                        train_loss, valid_loss))
-                    
-                    time_elapsed = (time.time() - stime)
-                    pred_time_remaining = (time_elapsed / epoch) * (epochs-epoch)
-                    
-                    print('time elapsed: %.2f s | predicted time remaining: %.2f s' % (
-                        time_elapsed, pred_time_remaining))
-        
-        # load best model
-        model.load_state_dict(best_state_dict)
-        
-        # produce loss curves
-        if plot_losses:
-            
-            Train_losses = np.array(train_losses)
-            Train_losses[np.where(Train_losses > 100)] = 100
-            
-            Valid_losses = np.array(valid_losses)
-            Valid_losses[np.where(Valid_losses > 100)] = 100
-            
-            plt.figure()
-            
-            plt.plot(range(1,epochs+1), Train_losses, '0.4', label = 'training')
-            plt.plot(range(1,epochs+1), Valid_losses, 'b', label = 'validation')
-            
-            plt.xlabel('Epochs')
-            plt.xticks(range(0,epochs+1,int(epochs // 10)))
-            plt.ylabel('Deviance [-2*LogLikelihood]')
-            plt.title('Loss Curves')
-            plt.legend()
-            plt.show()
-            
-        return best_epoch, train_losses, valid_losses
 
+                if save_path is not None and os.path.exists(save_path):
+                    torch.save(best_state_dict, save_path+'/state_dict.pt')
 
-
-# class for training model using Gaussian negative log-likelihood
-class TrainerGaussianNLL(object):
-    
-    def __init__(self, optimizer, suppress_prints = False):
-        # optimizer: optimizer object used during training
-        self.optimizer = optimizer
-        self.suppress = suppress_prints
-    
-    # method for training
-    def train(self, model, train_data, valid_data, 
-              epochs = 100, batch_size = 64, plot_losses = False):
-        # model: initialized model to be trained
-        # train_data: Data object containing training data
-        # valid_data: Data object containing validation data
-        
-        # send model to device
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        model = model.to(device)
-        
-        # create dataloader objects for training data and validation data
-        train_dataloader = DataLoader(train_data, batch_size = batch_size, shuffle = True)
-        valid_dataloader = DataLoader(valid_data, batch_size = batch_size, shuffle = True)
-        
-        train_losses = []
-        valid_losses = []
-        
-        stime = time.time()
-        
-        best_loss = 1e10
-        
-        if not self.suppress:
-            print('\ntraining.....\n')
-        for epoch in range(1,epochs+1):        
-            train_loss = 0
-            valid_loss = 0
-            
-            model.train()
-            # iterate over the training data
-            for input_batch, label_batch in train_dataloader:
-                input_batch = ag.Variable(input_batch.to(device))
-                label_batch = ag.Variable(label_batch.to(device))
-                
-                # produce prediction distributions
-                pred_mean, pred_vars = model.predict(input_batch, return_sample = False)
-                # compute loss
-                loss = 2*nn.GaussianNLLLoss()(pred_mean, label_batch, pred_vars)
-                
-                # zero gradients
-                self.optimizer.zero_grad()
-                # backpropagate loss
-                loss.backward()
-                # prevent exploding gradients
-                clip_grad_value_(model.parameters(), clip_value = 5.0)
-                # update weights
-                self.optimizer.step()
-                # aggregate training loss
-                train_loss += loss.item()
-            
-            # compute mean training loss and save to list
-            train_loss /= len(train_dataloader)
-            train_losses.append(train_loss)
-            
-            model.eval()
-            with torch.no_grad():
-                # iterate over validation data
-                for input_batch, label_batch in valid_dataloader:
-                    # produce prediction distributions
-                    pred_mean, pred_vars = model.predict(input_batch, return_sample = False)
-                    # compute and aggregate validation loss 
-                    valid_loss += 2*nn.GaussianNLLLoss()(pred_mean, label_batch, pred_vars).item()
-            
-            # compute mean validation loss and save to list
-            valid_loss /= len(valid_dataloader)
-            valid_losses.append(valid_loss)
-            
-            # save model that performs best on validation data
-            if valid_loss < best_loss:
-                best_loss = valid_loss
-                best_epoch = epoch
-                best_state_dict = deepcopy(model.state_dict())
-            
-            if not self.suppress:
-                # printing
-                if epoch % 10 == 0:
-                    print(f'------------------{epoch}------------------')
-                    print('training loss: %.2f | validation loss: %.2f' % (
-                        train_loss, valid_loss))
-                    
-                    time_elapsed = (time.time() - stime)
-                    pred_time_remaining = (time_elapsed / epoch) * (epochs-epoch)
-                    
-                    print('time elapsed: %.2f s | predicted time remaining: %.2f s' % (
-                        time_elapsed, pred_time_remaining))
-        
-        # load best model
-        model.load_state_dict(best_state_dict)
-        
-        # plot loss curves
-        if plot_losses:
-            
-            Train_losses = np.array(train_losses)
-            Train_losses[np.where(Train_losses > 100)] = 100
-            
-            Valid_losses = np.array(valid_losses)
-            Valid_losses[np.where(Valid_losses > 100)] = 100
-            
-            plt.figure()
-            
-            plt.plot(range(1,epochs+1), Train_losses, '0.4', label = 'training')
-            plt.plot(range(1,epochs+1), Valid_losses, 'b', label = 'validation')
-            
-            plt.xlabel('Epochs')
-            plt.xticks(range(0,epochs+1,int(epochs // 10)))
-            plt.ylabel('Deviance [-2*LogLikelihood]')
-            plt.title('Loss Curves')
-            plt.legend()
-            plt.show()
-            
-        return best_epoch, train_losses, valid_losses
-
-
-
-class TrainerMultivariateNormalNLL(object):
-    
-    def __init__(self, optimizer, suppress_prints = False):
-        # optimizer: optimizer object used during training
-        self.optimizer = optimizer
-        self.suppress = suppress_prints
-    
-    # method for training
-    def train(self, model, train_data, valid_data, 
-              epochs = 100, batch_size = 64, plot_losses = False):
-        # model: initialized model to be trained
-        # train_data: Data object containing training data
-        # valid_data: Data object containing validation data
-        
-        # send model to device
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        model = model.to(device)
-        
-        # create dataloader objects for training data and validation data
-        train_dataloader = DataLoader(train_data, batch_size = batch_size, shuffle = True)
-        valid_dataloader = DataLoader(valid_data, batch_size = batch_size, shuffle = True)
-        
-        train_losses = []
-        valid_losses = []
-        
-        stime = time.time()
-        
-        best_loss = 1e10
-        
-        if not self.suppress:
-            print('\ntraining.....\n')
-        for epoch in range(1,epochs+1):        
-            train_loss = 0
-            valid_loss = 0
-            
-            model.train()
-            # iterate over the training data
-            for input_batch, label_batch in train_dataloader:
-                input_batch = ag.Variable(input_batch.to(device))
-                label_batch = ag.Variable(label_batch.float().to(device))
-                
-                # produce prediction distributions
-                pred_mean, pred_scale_tril = model.predict(
-                    input_batch, return_sample = False, scale_tril = True,
-                    )
-                # compute loss
-                mvn = MultivariateNormal(loc = pred_mean, scale_tril = pred_scale_tril)
-                loss = -mvn.log_prob(label_batch).mean(dim = 0)
-                
-                # zero gradients
-                self.optimizer.zero_grad()
-                # backpropagate loss
-                loss.backward()
-                # prevent exploding gradients
-                clip_grad_value_(model.parameters(), clip_value = 5.0)
-                # update weights
-                self.optimizer.step()
-                # aggregate training loss
-                train_loss += loss.item()
-            
-            # compute mean training loss and save to list
-            train_loss /= len(train_dataloader)
-            train_losses.append(train_loss)
-            
-            model.eval()
-            with torch.no_grad():
-                # iterate over validation data
-                for input_batch, label_batch in valid_dataloader:
-                    # produce prediction distributions
-                    pred_mean, pred_scale_tril = model.predict(
-                        input_batch, return_sample = False, scale_tril = True,
+                    with open(save_path+'/losses.json', 'w') as f:
+                        json.dump(
+                            {'train losses' : train_losses, 'valid losses': valid_losses}, f
                         )
-                    # compute and aggregate validation loss 
-                    valid_loss += -MultivariateNormal(
-                        loc = pred_mean, scale_tril = pred_scale_tril,
-                        ).log_prob(label_batch.float()).mean(dim = 0).item()
-            
-            # compute mean validation loss and save to list
-            valid_loss /= len(valid_dataloader)
-            valid_losses.append(valid_loss)
-            
-            # save model that performs best on validation data
-            if valid_loss < best_loss:
-                best_loss = valid_loss
-                best_epoch = epoch
-                best_state_dict = deepcopy(model.state_dict())
+
             
             if not self.suppress:
                 # printing
-                if epoch % 10 == 0:
+                if epoch % self.print_every == 0:
                     print(f'------------------{epoch}------------------')
                     print('training loss: %.2f | validation loss: %.2f' % (
                         train_loss, valid_loss))
@@ -368,48 +141,116 @@ class TrainerMultivariateNormalNLL(object):
         if plot_losses:
             
             Train_losses = np.array(train_losses)
-            Train_losses[np.where(Train_losses > 100)] = 100
+            Train_losses[np.where(Train_losses > 5)] = 5
             
             Valid_losses = np.array(valid_losses)
-            Valid_losses[np.where(Valid_losses > 100)] = 100
+            Valid_losses[np.where(Valid_losses > 5)] = 5
             
-            plt.figure()
+            fig = plt.figure()
             
             plt.plot(range(1,epochs+1), Train_losses, '0.4', label = 'training')
             plt.plot(range(1,epochs+1), Valid_losses, 'b', label = 'validation')
             
             plt.xlabel('Epochs')
             plt.xticks(range(0,epochs+1,int(epochs // 10)))
-            plt.ylabel('Deviance [-2*LogLikelihood]')
+            plt.ylabel('Negative Log Likelihood')
             plt.title('Loss Curves')
             plt.legend()
-            plt.show()
+
+            return best_epoch, train_losses, valid_losses, fig
             
         return best_epoch, train_losses, valid_losses
     
 
 
-class TrainerExpectationMaximization(object):
+class TrainerMLE1(object):
     
     def __init__(self, optimizer, suppress_prints = False):
         # optimizer: optimizer object used during training
         self.optimizer = optimizer
         self.suppress = suppress_prints
+        print(torch.cuda.device_count(), 'GPUs available')
+        self.distributed = torch.cuda.device_count() > 1
+        print('distributed bool: ', self.distributed)
+
+    
+    def train(
+            self, model, train_data, valid_data, grad_clip_value = 5,
+            epochs = 100, batch_size = 256, shuffle = True, plot_losses = False,
+            ):
+        if self.distributed:
+            world_size = torch.cuda.device_count()
+            mp.spawn(
+                self.multiprocess,
+                args = (world_size, model, train_data, valid_data,
+                        grad_clip_value, epochs, batch_size,
+                        shuffle, plot_losses,
+                        ),
+                nprocs = world_size,
+                )
+        
+        else:
+            rank = 'cuda' if torch.cuda.is_available() else 'cpu'
+            self.single_process(
+                rank, model, train_data, valid_data, grad_clip_value, epochs,
+                batch_size, shuffle, plot_losses,
+            )
+
+
+    def DDP_setup(self, rank, world_size):
+        os.environ['MASTER_ADDR'] = 'localhost'
+        os.environ['MASTER_PORT'] = '12355'
+
+        init_process_group(backend = 'nccl', rank = rank, world_size = world_size)
+        torch.cuda.set_device(rank)
+
+
+    def multiprocess(
+            self, rank, world_size, model, train_data, valid_data, 
+            grad_clip_value, epochs, batch_size, shuffle, plot_losses,
+            ):
+        self.DDP_setup(rank, world_size)
+
+        self.single_process(
+            rank, model, train_data, valid_data, grad_clip_value, epochs,
+            batch_size, shuffle, plot_losses,
+            )
+        
+        destroy_process_group()
+
     
     # method for training
-    def train(self, model, train_data, valid_data, 
-              epochs = 100, batch_size = 64, plot_losses = False):
+    def single_process(
+            self, rank, model, train_data, valid_data, grad_clip_value,
+            epochs, batch_size, shuffle, plot_losses,
+            ):
         # model: initialized model to be trained
         # train_data: Data object containing training data
         # valid_data: Data object containing validation data
         
         # send model to device
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        model = model.to(device)
+        model = model.to(rank)
+
+        if self.distributed:
+            model = DDP(model, device_ids = [rank])
         
         # create dataloader objects for training data and validation data
-        train_dataloader = DataLoader(train_data, batch_size = batch_size, shuffle = True)
-        valid_dataloader = DataLoader(valid_data, batch_size = batch_size, shuffle = True)
+        if self.distributed:
+            train_dataloader = DataLoader(
+                train_data, batch_size = batch_size, shuffle = False,
+                sampler = DistributedSampler(train_data),
+                )
+            valid_dataloader = DataLoader(
+                valid_data, batch_size = batch_size, shuffle = False,
+                sampler = DistributedSampler(valid_data),
+                )
+        else:
+            train_dataloader = DataLoader(
+                train_data, batch_size = batch_size, shuffle = shuffle,
+                )
+            valid_dataloader = DataLoader(
+                valid_data, batch_size = batch_size, shuffle = shuffle,
+                )
         
         train_losses = []
         valid_losses = []
@@ -417,32 +258,46 @@ class TrainerExpectationMaximization(object):
         stime = time.time()
         
         best_loss = 1e10
+        if self.distributed:
+            best_state_dict = deepcopy(model.module.state_dict())
+        else:
+            best_state_dict = deepcopy(model.state_dict())
         
-        if not self.suppress:
-            print('\ntraining.....\n')
-        for epoch in range(1,epochs+1):        
+        for epoch in range(1,epochs+1):
+            if self.distributed and shuffle:
+                train_dataloader.sampler.set_epoch(epoch)
+                valid_dataloader.sampler.set_epoch(epoch)
+
             train_loss = 0
             valid_loss = 0
             
             model.train()
             # iterate over the training data
             for input_batch, label_batch in train_dataloader:
-                input_batch = ag.Variable(input_batch.to(device))
-                label_batch = ag.Variable(label_batch.to(device))
+                try:
+                    input_batch = ag.Variable(input_batch.to(rank))
+                    label_batch = ag.Variable(label_batch.to(rank))
+                    
+                    # minimize negative log likelihood
+                    nll = -1 * model.log_prob(input_batch, label_batch).mean(dim = 0)
+                    
+                    # zero gradients
+                    self.optimizer.zero_grad()
+                    # backpropagate loss
+                    nll.backward()
+                    # prevent exploding gradients
+                    clip_grad_value_(model.parameters(), clip_value = grad_clip_value)
+                    # update weights
+                    self.optimizer.step()
+                    # aggregate training loss
+                    train_loss += nll.item()
                 
-                # produce prediction distributions
-                loss = model.expect(input_batch, label_batch)
-                                
-                # zero gradients
-                self.optimizer.zero_grad()
-                # backpropagate loss
-                loss.backward()
-                # prevent exploding gradients
-                clip_grad_value_(model.parameters(), clip_value = 2)
-                # update weights
-                self.optimizer.step()
-                # aggregate training loss
-                train_loss += loss.item()
+                except:
+                    # if NaNs encountered in gradients
+                    print('exception occurred during parameter update step')
+                    model.load_state_dict(best_state_dict)
+                    train_loss += 10
+
             
             # compute mean training loss and save to list
             train_loss /= len(train_dataloader)
@@ -452,10 +307,17 @@ class TrainerExpectationMaximization(object):
             with torch.no_grad():
                 # iterate over validation data
                 for input_batch, label_batch in valid_dataloader:
-                    # produce prediction distributions
-                    loss = model.expect(input_batch, label_batch)
-                    # compute and aggregate validation loss 
-                    valid_loss += loss.item()
+                    try:
+                        # produce negative log likelihood
+                        nll = -1 * model.log_prob(
+                            input_batch.to(rank), label_batch.to(rank)).mean(dim = 0)
+                        # compute and aggregate validation loss 
+                        valid_loss += nll.item()
+                    
+                    except:
+                        print('exception occurred during parameter validation step')
+                        model.load_state_dict(best_state_dict)
+                        valid_loss += 10
             
             # compute mean validation loss and save to list
             valid_loss /= len(valid_dataloader)
@@ -465,7 +327,10 @@ class TrainerExpectationMaximization(object):
             if valid_loss < best_loss:
                 best_loss = valid_loss
                 best_epoch = epoch
-                best_state_dict = deepcopy(model.state_dict())
+                if self.distributed:
+                    best_state_dict = deepcopy(model.module.state_dict())
+                else:
+                    best_state_dict = deepcopy(model.state_dict())
             
             if not self.suppress:
                 # printing
@@ -492,139 +357,21 @@ class TrainerExpectationMaximization(object):
             Valid_losses = np.array(valid_losses)
             Valid_losses[np.where(Valid_losses > 100)] = 100
             
-            plt.figure()
+            fig = plt.figure()
             
             plt.plot(range(1,epochs+1), Train_losses, '0.4', label = 'training')
             plt.plot(range(1,epochs+1), Valid_losses, 'b', label = 'validation')
             
             plt.xlabel('Epochs')
             plt.xticks(range(0,epochs+1,int(epochs // 10)))
-            plt.ylabel('Negative Mean Log Expectation')
+            plt.ylabel('Negative Log Likelihood')
             plt.title('Loss Curves')
             plt.legend()
-            plt.show()
+
+            return best_epoch, train_losses, valid_losses, fig
             
         return best_epoch, train_losses, valid_losses
 
-
-class TrainerExpectationMaximization1(object):
-    
-    def __init__(self, optimizer, suppress_prints = False):
-        # optimizer: optimizer object used during training
-        self.optimizer = optimizer
-        self.suppress = suppress_prints
-    
-    # method for training
-    def train(self, model, train_data, valid_data, 
-              epochs = 100, batch_size = 64, plot_losses = False):
-        # model: initialized model to be trained
-        # train_data: Data object containing training data
-        # valid_data: Data object containing validation data
-        
-        # send model to device
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        model = model.to(device)
-        
-        # create dataloader objects for training data and validation data
-        train_dataloader = DataLoader(train_data, batch_size = batch_size, shuffle = True)
-        valid_dataloader = DataLoader(valid_data, batch_size = batch_size, shuffle = True)
-        
-        train_losses = []
-        valid_losses = []
-        
-        stime = time.time()
-        
-        best_loss = 1e10
-        
-        if not self.suppress:
-            print('\ntraining.....\n')
-        for epoch in range(1,epochs+1):        
-            train_loss = 0
-            valid_loss = 0
-            
-            model.train()
-            # iterate over the training data
-            for input_batch, label_batch in train_dataloader:
-                input_batch = ag.Variable(input_batch.to(device))
-                label_batch = ag.Variable(label_batch.to(device))
-                
-                # produce prediction distributions
-                loss, gamma = model.expect(input_batch, label_batch)
-                
-                model.maximize(gamma, label_batch)
-                
-                # zero gradients
-                self.optimizer.zero_grad()
-                # backpropagate loss
-                loss.backward()
-                # prevent exploding gradients
-                clip_grad_value_(model.parameters(), clip_value = 1.0)
-                # update weights
-                self.optimizer.step()
-                # aggregate training loss
-                train_loss += loss.item()
-            
-            # compute mean training loss and save to list
-            train_loss /= len(train_dataloader)
-            train_losses.append(train_loss)
-            
-            model.eval()
-            with torch.no_grad():
-                # iterate over validation data
-                for input_batch, label_batch in valid_dataloader:
-                    # produce prediction distributions
-                    expectation = model.expect(input_batch, label_batch)
-                    # compute and aggregate validation loss 
-                    valid_loss += (-1 * torch.log(expectation).mean(dim = 0)).item()
-            
-            # compute mean validation loss and save to list
-            valid_loss /= len(valid_dataloader)
-            valid_losses.append(valid_loss)
-            
-            # save model that performs best on validation data
-            if valid_loss < best_loss:
-                best_loss = valid_loss
-                best_epoch = epoch
-                best_state_dict = deepcopy(model.state_dict())
-            
-            if not self.suppress:
-                # printing
-                if epoch % 10 == 0:
-                    print(f'------------------{epoch}------------------')
-                    print('training loss: %.2f | validation loss: %.2f' % (
-                        train_loss, valid_loss))
-                    
-                    time_elapsed = (time.time() - stime)
-                    pred_time_remaining = (time_elapsed / epoch) * (epochs-epoch)
-                    
-                    print('time elapsed: %.2f s | predicted time remaining: %.2f s' % (
-                        time_elapsed, pred_time_remaining))
-        
-        # load best model
-        model.load_state_dict(best_state_dict)
-        
-        # plot loss curves
-        if plot_losses:
-            
-            Train_losses = np.array(train_losses)
-            Train_losses[np.where(Train_losses > 100)] = 100
-            
-            Valid_losses = np.array(valid_losses)
-            Valid_losses[np.where(Valid_losses > 100)] = 100
-            
-            plt.figure()
-            
-            plt.plot(range(1,epochs+1), Train_losses, '0.4', label = 'training')
-            plt.plot(range(1,epochs+1), Valid_losses, 'b', label = 'validation')
-            
-            plt.xlabel('Epochs')
-            plt.xticks(range(0,epochs+1,int(epochs // 10)))
-            plt.ylabel('Negative Mean Log Expectation')
-            plt.title('Loss Curves')
-            plt.legend()
-            plt.show()
-            
-        return best_epoch, train_losses, valid_losses
 
 
 # training scheme for two-model framework

@@ -1,23 +1,39 @@
-from copy import deepcopy
-import matplotlib.pyplot as plt
 import torch
 from torch import nn as nn
-from torch import autograd as ag
-from torch.distributions.normal import Normal
-from torch.distributions.multivariate_normal import MultivariateNormal
-import numpy as np
-import time as time
 
 
 
 class LTC(nn.Module):
+
+    def __init__(
+            self, input_dim, hidden_dim, num_layers = 1,
+            use_cell_memory = False, ode_solver_unfolds = 6, epsilon = 1e-8,
+            input_mapping = 'affine', output_mapping = 'affine',
+            ):
+        super(LTC, self).__init__()
+
+        layers = []
+        for _ in range(num_layers):
+            layers.append(LTCLayer(
+                input_dim, hidden_dim, use_cell_memory, ode_solver_unfolds,
+                epsilon, input_mapping, output_mapping,
+                ))
+        self.ltc_layers = nn.Sequential(*layers)
+    
+    def forward(self, x, state = None):
+        output, state = self.ltc_layers(x, state)
+        return output, state
+
+
+
+class LTCLayer(nn.Module):
     
     def __init__(
             self, input_dim, hidden_dim, use_cell_memory = False, 
             ode_solver_unfolds = 6, epsilon = 1e-8,
             input_mapping = 'affine', output_mapping = 'affine',
             ):
-        super(LTC, self).__init__()
+        super(LTCLayer, self).__init__()
         
         self.hidden_dim = hidden_dim
         
@@ -134,7 +150,7 @@ class LTCCell(nn.Module):
         
         cm_t = self.cm / (time_elapsed / self.ode_unfolds)
         
-        for t in range(self.ode_unfolds):
+        for _ in range(self.ode_unfolds):
             w_activated = self.internal_w * self.sigmoid(
                 V, self.internal_mu, self.internal_sigma)
             

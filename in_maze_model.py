@@ -5,24 +5,22 @@ import torch
 from torch import nn as nn
 from torch import autograd as ag
 from torch.utils.data import DataLoader
-from torch.nn.utils import clip_grad_norm_, clip_grad_value_
+from torch.nn.utils import clip_grad_value_
 import time
 from copy import deepcopy
-from maze_utils import RangeNormalize
-from state_process_models import Data
+from maze_utils import RangeNormalize, Data
 from data_generation import generate_trajectory_history, data_to_index
 
 
 # method for generating history of in-maze probabilities
-def generate_inside_maze_prob_history(data, inside_maze_model):
+def generate_inside_maze_prob_history(data, inside_maze_model, untransform = False):
     # data: trajectory data
     # inside_maze_model: in-maze classifier
     
     prob_hist = torch.zeros((data.size(0), data.size(1), 1))
     
     for h in range(data.size(1)):
-        print(h)
-        prob_hist[:,h,:] = inside_maze_model(data[:,h,:]).unsqueeze(1)
+        prob_hist[:,h,:] = inside_maze_model(data[:,h,:], untransform).unsqueeze(-1)
     
     return torch.cat([data, prob_hist], dim = 2)
     
@@ -67,7 +65,6 @@ class InMazeModelNN(nn.Module):
         self.lin = nn.Sequential(*layers)
         self.final = nn.LogSoftmax(dim = 1) if log_prob_model else nn.Sigmoid()
 
-        
     # forward call
     def forward(self, x):
         return self.final(self.lin(x)).squeeze()
@@ -596,7 +593,7 @@ class TrainerNLL(object):
 
 class GridClassifier(nn.Module):
     
-    def __init__(self, grid, xmin, ymin, resolution, transform):
+    def __init__(self, grid, xmin, ymin, resolution, transform = None):
         super(GridClassifier, self).__init__()
         
         self.grid = grid
@@ -607,23 +604,30 @@ class GridClassifier(nn.Module):
     
     def forward(self, x, untransform = True):
         dat = x.unsqueeze(0) if x.dim() == 1 else x
-        dat = self.tf.untransform(dat)
-        dat = dat.unsqueeze(0) if dat.dim() == 1 else dat
+        if untransform:
+            dat = self.tf.untransform(dat)
+            dat = dat.unsqueeze(0) if dat.dim() == 1 else dat.squeeze(1)
         ix = data_to_index(
             dat, self.xmin, self.ymin, self.resolution, unique = False)
         
         if x.dim() == 1:
             xix, yix = ix[0,0], ix[0,1]
-            out = self.grid[xix,yix]
+            if xix >= self.grid.size(0) or yix >= self.grid.size(1):
+                out = 0
+            else:
+                out = self.grid[xix,yix]
         else:
             out = []
             for i in range(ix.size(0)):
                 xix, yix = ix[i,0], ix[i,1]
-                out.append(self.grid[xix,yix].unsqueeze(0))
+                if xix >= self.grid.size(0) or yix >= self.grid.size(1) or xix < 0 or yix < 0:
+                    out.append(torch.tensor(0).unsqueeze(0))
+                else:
+                    out.append(self.grid[xix,yix].unsqueeze(0))
             out = torch.cat(out, dim = 0)
         return out
     
-    def predict(self, x, untransform = True):
+    def predict(self, x, untransform = False):
         return self.forward(x, untransform)
 
 
